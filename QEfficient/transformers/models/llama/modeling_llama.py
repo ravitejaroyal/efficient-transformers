@@ -138,7 +138,7 @@ class QEffLlamaAttention(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]], torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -155,6 +155,7 @@ class QEffLlamaAttention(LlamaAttention):
         kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        q_last = query_states[:, :, -1, :]
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -175,7 +176,7 @@ class QEffLlamaAttention(LlamaAttention):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_value, q_last
 
 
 class QEffLlamaDecoderLayer(LlamaDecoderLayer):
@@ -202,7 +203,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, q_last = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -227,6 +228,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
             outputs += (self_attn_weights,)
         if use_cache:
             outputs += (present_key_value,)
+        outputs += (q_last,)
 
         return outputs
 
@@ -287,6 +289,7 @@ class QEffLlamaModel(LlamaModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        layer_q_last_list = []
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -305,6 +308,8 @@ class QEffLlamaModel(LlamaModel):
             )
 
             hidden_states = layer_outputs[0]
+            q_last = layer_outputs[-1]
+            layer_q_last_list.append(q_last)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -318,13 +323,18 @@ class QEffLlamaModel(LlamaModel):
         if return_legacy_cache:
             past_key_values = past_key_values.to_legacy_cache()
 
+        prefill_queries = torch.stack(layer_q_last_list, dim=0)
+        if prefill_queries.shape[1] == 1:
+            prefill_queries = prefill_queries.squeeze(1)
+
         output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-        return output if return_dict else output.to_tuple()
+        setattr(output, "prefill_queries", prefill_queries)
+        return output if return_dict else output.to_tuple() + (prefill_queries,)
 
 
 class QEffLlamaForCausalLM(LlamaForCausalLM):
@@ -380,10 +390,12 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=None,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        setattr(out, "prefill_queries", getattr(outputs, "prefill_queries", None))
+        return out
