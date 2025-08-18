@@ -1612,32 +1612,12 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 dynamic_axes=dynamic_axes,
             )
 
-        class _ExportHead(torch.nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.model = model
-
-            def forward(self, inputs):
-                # Always request a mapping so we can index fields safely
-                out = self.model(**inputs, return_dict=True, use_cache=True)
-                # Build the flat tuple in the same order as output_names
-                t = [out.logits]
-                for k, v in out.past_key_values:
-                    t += [k, v]
-                t.append(out.prefill_queries)
-                return tuple(t)
-
-        _prev_model = self.model
-        try:
-            self.model = _ExportHead(_prev_model)
-            return self._export(
-                example_inputs,
-                output_names,
-                dynamic_axes,
-                export_dir=export_dir,
-            )
-        finally:
-            self.model = _prev_model
+        return self._export(
+            example_inputs,
+            output_names,
+            dynamic_axes,
+            export_dir=export_dir,
+        )
 
     def get_sampling_inputs_and_outputs(
         self,
