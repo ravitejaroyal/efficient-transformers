@@ -1593,6 +1593,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                     dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes
                     output_names.append(f"past_{kv}.{i}_RetainedState")
 
+        output_names.append("prefill_queries")
+        dynamic_axes["prefill_queries"] = {0: "layers", 1: "head", 2: "dim"}
+
         if self.continuous_batching:
             example_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
             dynamic_axes["batch_index"] = {0: "batch_size"}
