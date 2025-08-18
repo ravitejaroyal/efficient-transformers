@@ -10,9 +10,9 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
+from QEfficient.transformers.models.modeling_outputs_qeff import (
+    QEffBaseModelOutputWithPast,
+    QEffCausalLMOutputWithPast,
 )
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -254,7 +254,7 @@ class QEffLlamaModel(LlamaModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, QEffBaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -327,14 +327,14 @@ class QEffLlamaModel(LlamaModel):
         if prefill_queries.shape[1] == 1:
             prefill_queries = prefill_queries.squeeze(1)
 
-        output = BaseModelOutputWithPast(
+        out = QEffBaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            prefill_queries=prefill_queries,
         )
-        setattr(output, "prefill_queries", prefill_queries)
-        return output if return_dict else output.to_tuple() + (prefill_queries,)
+        return out if return_dict else out.to_tuple()
 
 
 class QEffLlamaForCausalLM(LlamaForCausalLM):
@@ -360,7 +360,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, QEffCausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -390,12 +390,12 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        out = CausalLMOutputWithPast(
+        out = QEffCausalLMOutputWithPast(
             loss=None,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            prefill_queries=getattr(outputs, "prefill_queries", None),
         )
-        setattr(out, "prefill_queries", getattr(outputs, "prefill_queries", None))
         return out
