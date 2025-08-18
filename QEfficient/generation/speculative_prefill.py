@@ -131,3 +131,98 @@ class SpeculativePrefillEngine:
             "logits": logits,
             "S": int(S),
         }
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    from QEfficient.utils import load_hf_tokenizer
+
+    parser = argparse.ArgumentParser(
+        description="Step 4.1 sanity check: run speculator prefill and print shapes."
+    )
+    parser.add_argument("--spec-qpc", required=True, help="Path to speculator QPC directory (…/qpc)")
+    parser.add_argument("--model-name", default="meta-llama/Meta-Llama-3-8B", help="HF tokenizer card")
+    parser.add_argument("--prompt", default="Hello from speculative prefill on AI100.",
+                        help="Prompt text for a single-run sanity check")
+    parser.add_argument("--prompt-len", type=int, default=16, help="prefill chunk length")
+    parser.add_argument("--ctx-len", type=int, default=128, help="context length")
+    parser.add_argument("--device-ids", default="[0]", help="Device IDs like [0] or [0,1]")
+    parser.add_argument("--also-long", action="store_true",
+                        help="Optionally run a longer prompt to force multiple chunks")
+    args = parser.parse_args()
+
+    # Parse device list safely
+    try:
+        dev_ids = [int(x) for x in args.device_ids.strip("[] ").split(",") if x.strip() != ""]
+    except Exception:
+        print(f"[warn] Could not parse --device-ids={args.device_ids!r}, defaulting to [0]")
+        dev_ids = [0]
+
+    # Load tokenizer and engine
+    tok = load_hf_tokenizer(args.model_name)
+    eng = SpeculativePrefillEngine(
+        spec_qpc_path=args.spec_qpc,
+        tokenizer=tok,
+        ctx_len=int(args.ctx_len),
+        prompt_len=int(args.prompt_len),
+        device_ids=dev_ids,
+    )
+
+    def run_once(prompt_text: str) -> int:
+        print("\n=== PROMPT ===", prompt_text[:120])
+        out = eng.spec_prefill(prompt_text)
+        q = out.get("prefill_queries", None)
+        keys = out.get("past_keys", [])
+        logits = out.get("logits", None)
+        S = int(out.get("S", 0))
+
+        # Basic presence checks
+        if q is None or logits is None or not isinstance(keys, list) or len(keys) == 0:
+            print("[fail] Missing one of: prefill_queries / logits / past_keys")
+            return 1
+
+        # Shapes & dims
+        print(f"[spec] prefill_queries shape: {q.shape}")
+        print(f"[spec] first past_key shape: {keys[0].shape}   layers: {len(keys)}")
+        print(f"[spec] logits shape: {logits.shape}")
+        print(f"[spec] S (tokenized): {S}")
+
+        # Expected dims for Meta-Llama-3-8B spec (L=32, H=32, H_kv=8, D=128)
+        L, H, D = q.shape
+        H_kv = keys[0].shape[1]
+        S_key = keys[0].shape[2]
+
+        ok = True
+        if L != 32:
+            print(f"[warn] L mismatch: got {L}, expected 32"); ok = False
+        if H != 32:
+            print(f"[warn] H mismatch: got {H}, expected 32"); ok = False
+        if H_kv != 8:
+            print(f"[warn] H_kv mismatch: got {H_kv}, expected 8"); ok = False
+        if D != 128:
+            print(f"[warn] D mismatch: got {D}, expected 128"); ok = False
+
+        # Prefill chunking sanity
+        cs = eng._prefill_seq_len
+        padded_len = ((S + cs - 1) // cs) * cs
+        chunks = padded_len // cs
+        print(f"[spec] prefill_seq_len={cs}  padded_len={padded_len}  chunks={chunks}")
+        if not (S <= S_key <= padded_len):
+            print(f"[warn] Key seq length unexpected: S={S}  key_S={S_key}  padded_len={padded_len}")
+            ok = False
+
+        # Dtypes
+        if logits.dtype != np.float32:
+            print(f"[warn] logits dtype is {logits.dtype}, expected float32"); ok = False
+
+        print("[OK]" if ok else "[WARN] see messages above")
+        return 0 if ok else 2
+
+    rc = run_once(args.prompt)
+
+    if args.also_long:
+        long_prompt = " ".join(["This is a longer prompt to force multiple prefill chunks."] * 24)
+        rc2 = run_once(long_prompt)
+        rc = rc or rc2
+
+    sys.exit(rc)
