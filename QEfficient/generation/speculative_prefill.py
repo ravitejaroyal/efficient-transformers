@@ -26,12 +26,38 @@ class SpeculativePrefillEngine:
     ) -> None:
         self._spec = QAICInferenceSession(spec_qpc_path, device_ids=device_ids)
         self._tokenizer = tokenizer
+        # align with _set_tokenizer_params()
+        if getattr(self._tokenizer, "padding_side", "right") != "right":
+            self._tokenizer.padding_side = "right"
+        if getattr(self._tokenizer, "pad_token_id", None) is None:
+            self._tokenizer.pad_token_id = getattr(self._tokenizer, "eos_token_id", 0)
         self._ctx_len = ctx_len
         self._prefill_seq_len = prompt_len
         self.L: Optional[int] = None
         self.H: Optional[int] = None
         self.H_kv: Optional[int] = None
         self.D: Optional[int] = None
+
+        # prefer QPC-specialized values if present
+        try:
+            qpc_prefill = self._probe_prefill_seq_len()
+            if qpc_prefill != self._prefill_seq_len:
+                print(f"[spec] overriding prompt_len: QPC={qpc_prefill} vs user={self._prefill_seq_len}")
+                self._prefill_seq_len = qpc_prefill
+        except Exception:
+            pass
+
+    def _probe_vocab_size(self) -> int:
+        # look up binding for "logits" and read last dim
+        bidx = self._spec.binding_index_map["logits"]
+        dims = list(self._spec.bindings[bidx].dims)
+        return int(dims[-1])
+
+    def _probe_prefill_seq_len(self) -> int:
+        # read input_ids dims and take the time dimension used for prefill
+        bidx = self._spec.binding_index_map["input_ids"]
+        dims = list(self._spec.bindings[bidx].dims)
+        return int(dims[-1])
 
     def spec_prefill(self, prompt: str) -> Dict[str, Any]:
         """
@@ -44,19 +70,27 @@ class SpeculativePrefillEngine:
                 ``logits`` (np.ndarray): logits from the last chunk
                 ``S`` (int): tokenized length before padding
         """
+        # preallocate logits like runtime does (B=1, step=1)
+        try:
+            vocab = self._probe_vocab_size()
+            logits_placeholder = np.zeros((1, 1, vocab), dtype=np.float32)
+            self._spec.set_buffers({"logits": logits_placeholder})
+        except Exception:
+            pass
 
         enc = self._tokenizer(prompt, return_tensors="np")
-        ids = enc["input_ids"].astype("int64")
+        ids = enc["input_ids"].astype(np.int64)
         S = ids.shape[1]
+
+        pad_id = self._tokenizer.pad_token_id or getattr(self._tokenizer, "eos_token_id", 0)
         padded_len = ((S + self._prefill_seq_len - 1) // self._prefill_seq_len) * self._prefill_seq_len
-        pad_id = self._tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = getattr(self._tokenizer, "eos_token_id", None)
-        if pad_id is None:
-            pad_id = 0
-        ids_pad = np.pad(ids, ((0, 0), (0, padded_len - S)), constant_values=pad_id)
-        attn = (ids_pad != pad_id).astype("int64")
-        pos = np.where(attn == 1, np.arange(padded_len, dtype="int64"), -1).reshape(1, padded_len)
+        if padded_len > S:
+            ids_pad = np.pad(ids, ((0, 0), (0, padded_len - S)), constant_values=pad_id)
+        else:
+            ids_pad = ids
+
+        attn = (ids_pad != pad_id).astype(np.int64)
+        pos = np.where(attn == 1, np.arange(padded_len, dtype=np.int64), -1).reshape(1, padded_len)
 
         last_outs: Dict[str, np.ndarray] = {}
         for i in range(padded_len // self._prefill_seq_len):
