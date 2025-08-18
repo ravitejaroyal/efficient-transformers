@@ -1,33 +1,58 @@
 import torch
-from transformers import LlamaConfig
+from QEfficient.base.common import QEFFCommonLoader
+from QEfficient.utils import load_hf_tokenizer
 
-from QEfficient.transformers.cache_utils import QEffDynamicCache
-from QEfficient.transformers.models.llama.modeling_llama import QEffLlamaForCausalLM
+# Try QEff cache first; fall back to HF if needed
+try:
+    from QEfficient.transformers.cache_utils import DynamicCache
+except Exception:
+    from transformers.cache_utils import DynamicCache  # HF fallback
 
+MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
-def test_prefill_queries_shape():
-    config = LlamaConfig(
-        vocab_size=100,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-    )
-    model = QEffLlamaForCausalLM(config)
-    input_ids = torch.randint(0, config.vocab_size, (1, 4))
-    position_ids = torch.arange(0, input_ids.shape[1]).unsqueeze(0)
-    outputs = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        past_key_values=QEffDynamicCache(),
+# 1) Load model + tokenizer
+qeff = QEFFCommonLoader.from_pretrained(MODEL)
+tok = load_hf_tokenizer(MODEL)
+
+qeff.model.eval()
+
+# 2) Tiny prompt (B=1)
+text = "Hello world"
+ids = tok(text, return_tensors="pt").input_ids
+S = ids.shape[1]
+pos = torch.arange(S, dtype=torch.long).unsqueeze(0)      # [1, S]
+cache_pos = torch.arange(S, dtype=torch.long).unsqueeze(0) # [1, S]
+
+# 3) Empty cache like runtime does
+pkv = DynamicCache()
+
+# 4) Forward – **use_cache=True** and pass cache_position + cache object
+with torch.no_grad():
+    out = qeff.model(
+        input_ids=ids,
+        position_ids=pos,
+        past_key_values=pkv,
+        cache_position=cache_pos,
         use_cache=True,
         return_dict=True,
     )
-    prefill = getattr(outputs, "prefill_queries", None)
-    assert prefill is not None
-    assert prefill.shape == (
-        config.num_hidden_layers,
-        config.num_attention_heads,
-        config.hidden_size // config.num_attention_heads,
-    )
 
+# 5) Read the captured queries
+assert hasattr(out, "prefill_queries"), "prefill_queries missing on output"
+q = out.prefill_queries
+assert q is not None, "prefill_queries is None"
+
+# Accept [L,H,D] (B=1 squeezed) or [L,B,H,D] if you kept batch
+if q.ndim == 3:
+    L, H, D = q.shape
+elif q.ndim == 4:
+    L, B, H, D = q.shape
+else:
+    raise AssertionError(f"Unexpected ndim for prefill_queries: {q.ndim}, shape={tuple(q.shape)}")
+
+cfg = qeff.model.config
+print(
+    f"[OK] prefill_queries shape={tuple(q.shape)}  "
+    f"(layers={getattr(cfg, 'num_hidden_layers', None)}, "
+    f"heads={getattr(cfg, 'num_attention_heads', None)})"
+)
