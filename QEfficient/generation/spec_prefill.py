@@ -186,8 +186,17 @@ class SpecPrefillEngine:
 
         scale = 1.0 / math.sqrt(float(D))
         scores = np.einsum("lhd,lhsd->lhs", q, K, optimize=True) * scale
-        attn = self._softmax_axis(scores, axis=-1)
+        attn = self._softmax_axis(scores, axis=-1)        # [L,H,S]
         attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)
+
+        # Optional numerics check: softmax sums ~1 along last axis
+        import os
+        if os.getenv("QEFF_SPEC_ASSERT", ""):
+            if not pool_kernel_size or pool_kernel_size <= 1:
+                sums = np.sum(attn, axis=-1)
+                assert np.allclose(sums, 1.0, atol=1e-3), (
+                    f"softmax sums not ~1; max dev: {np.max(np.abs(sums - 1.0))}"
+                )
 
         attn_lh = attn.reshape(L * H, S)
         importance = np.max(attn_lh, axis=0).astype(np.float32, copy=False)
@@ -272,6 +281,8 @@ class SpecPrefillEngine:
             imp = imp[:S_orig]
         # Assert we didn’t leak padded positions into importance
         assert imp.shape[0] == S_orig, f"importance length {imp.shape[0]} != S_orig {S_orig}"
+        assert np.isfinite(imp).all(), "importance contains non-finite values"
+        assert float(imp.sum()) > 0.0, "importance sums to zero"
 
         # Select keep indices over [0..S_orig-1]
         keep_idx = self.select_tokens(imp, keep_cfg)
@@ -280,8 +291,12 @@ class SpecPrefillEngine:
         if keep_idx.size > 0:
             assert keep_idx.dtype == np.int64, f"keep_idx dtype must be int64, got {keep_idx.dtype}"
             assert keep_idx.min() >= 0, f"negative keep index found: {keep_idx.min()}"
-            assert np.all(keep_idx < S_orig), f"keep_idx contains padded indices >= S_orig={S_orig}: {keep_idx.max()}"
-            assert keep_idx[-1] == S_orig - 1, f"last real token must be kept (expected {S_orig-1}, got {keep_idx[-1]})"
+            assert keep_idx.max() < S_orig, (
+                f"keep_idx contains padded indices >= S_orig={S_orig}: {keep_idx.max()}"
+            )
+            assert keep_idx[-1] == S_orig - 1, (
+                f"last real token must be kept (expected {S_orig-1}, got {keep_idx[-1]})"
+            )
 
         # Optional debug: set QEFF_SPEC_DEBUG=1 to print one-liner summary
         import os
