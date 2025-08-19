@@ -237,30 +237,65 @@ class SpecPrefillEngine:
         pool_kernel_size: int = 13,
         keep_cfg: Optional[KeepConfig] = None,
     ) -> Dict[str, Any]:
-        """Run spec prefill, compute importance and select keep indices."""
+        """
+        Run spec prefill, compute importance and select keep indices.
+        IMPORTANT: scoring is performed only over the true prompt length (S_orig),
+        excluding any padded/capacity tail present in QPC buffers.
+        """
         if keep_cfg is None:
-            keep_cfg = KeepConfig(
-                strategy="percentage", percentage=0.1, chunk=True, chunk_size=32
-            )
+            keep_cfg = KeepConfig(strategy="percentage", percentage=0.1, chunk=True, chunk_size=32)
 
+        # Run prefill exactly as before; get position_ids from the first pass
         outputs, position_ids, _ = self.run_prefill(
             prompt, generation_len=None, prefill_logit_bs=1
         )
-        tensors = self.collect_for_scoring(outputs)
-        q = tensors["prefill_queries"]
-        keys = tensors["past_keys"]
-        S = int(self._tokenizer(prompt, return_tensors="np")["input_ids"].shape[1])
 
-        imp = self.compute_importance(q, keys, pool_kernel_size=pool_kernel_size)
+        # Extract tensors for scoring
+        tensors = self.collect_for_scoring(outputs)
+        q = tensors["prefill_queries"]          # [L,H,D]
+        keys_raw = tensors["past_keys"]         # list of [1,H_kv,S_cap,D]
+        if len(keys_raw) == 0:
+            raise KeyError("No past_key.{i}_RetainedState outputs to score against")
+
+        # True prompt length (number of real tokens) from first-pass position_ids
+        S_orig = int(position_ids.max())        # NOT padded_len or ctx capacity
+        S_cap  = int(keys_raw[0].shape[2])
+
+        # Trim keys to true prompt length to ignore pad/capacity tail
+        keys = keys_raw
+        if S_cap > S_orig:
+            keys = [k[:, :, :S_orig, :].copy() for k in keys]   # keep [1,H_kv,S_orig,D]
+
+        # Compute importance and defensively ensure len == S_orig
+        imp = self.compute_importance(q, keys, pool_kernel_size=pool_kernel_size)  # [S_trim]
+        if imp.shape[0] > S_orig:
+            imp = imp[:S_orig]
+        # Assert we didn’t leak padded positions into importance
+        assert imp.shape[0] == S_orig, f"importance length {imp.shape[0]} != S_orig {S_orig}"
+
+        # Select keep indices over [0..S_orig-1]
         keep_idx = self.select_tokens(imp, keep_cfg)
 
+        # Simple anti-pad invariants
+        if keep_idx.size > 0:
+            assert keep_idx.dtype == np.int64, f"keep_idx dtype must be int64, got {keep_idx.dtype}"
+            assert keep_idx.min() >= 0, f"negative keep index found: {keep_idx.min()}"
+            assert np.all(keep_idx < S_orig), f"keep_idx contains padded indices >= S_orig={S_orig}: {keep_idx.max()}"
+            assert keep_idx[-1] == S_orig - 1, f"last real token must be kept (expected {S_orig-1}, got {keep_idx[-1]})"
+
+        # Optional debug: set QEFF_SPEC_DEBUG=1 to print one-liner summary
+        import os
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            kept_pct = (100.0 * len(keep_idx) / S_orig) if S_orig > 0 else 0.0
+            print(f"[spec:score] S_orig={S_orig} S_cap={S_cap} imp_len={imp.shape[0]} kept={len(keep_idx)} ({kept_pct:.1f}%)")
+
         return {
-            "importance": imp,
-            "keep_idx": keep_idx,
-            "S": S,
+            "importance": imp,         # length S_orig
+            "keep_idx": keep_idx,      # sorted unique, includes S_orig-1
+            "S": S_orig,               # true prompt length (non-pad count)
             "shapes": {
                 "prefill_queries": q.shape,
-                "first_key": keys[0].shape if len(keys) else None,
+                "first_key": keys_raw[0].shape if len(keys_raw) else None,  # report pre-trim shape for visibility
             },
         }
 
