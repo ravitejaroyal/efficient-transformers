@@ -347,24 +347,42 @@ def main() -> None:
         prefill_seq_len=int(args.prompt_len),
         device_ids=dev_ids,
     )
-
-    # 1) run prefill
-    outputs, position_ids, generation_len = eng.run_prefill(
-        args.prompt, generation_len=None, prefill_logit_bs=args.prefill_logit_bs
+    
+    # Build keep policy (use existing KeepConfig; do not redefine it)
+    keep_cfg = KeepConfig(
+        strategy="percentage",
+        percentage=0.1,   # keep 10%
+        chunk=True,
+        chunk_size=32,
     )
-    if "logits" not in outputs or "prefill_queries" not in outputs:
-        print("[fail] required outputs missing:", list(outputs.keys()))
-        sys.exit(2)
+    pool_kernel_size = 13
 
-    # 2) collect tensors for scoring
-    tensors = eng.collect_for_scoring(outputs)
-    q = tensors["prefill_queries"]
-    keys = tensors["past_keys"]
+    # Step 4.2: prefill + score + select (handles padding/capacity inside)
+    res = eng.prefill_and_score(
+        args.prompt,
+        pool_kernel_size=pool_kernel_size,
+        keep_cfg=keep_cfg,
+    )
 
-    print(f"[spec] prefill_queries: {q.shape}")
-    print(f"[spec] past_keys[0]: {keys[0].shape}  layers: {len(keys)}")
-    print(f"[spec] logits: {outputs['logits'].shape}")
-    sys.exit(0)
+    # Minimal anti-padding invariants
+    S = res["S"]
+    imp = res["importance"]
+    keep_idx = res["keep_idx"]
+    assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
+    if keep_idx.size > 0:
+        assert keep_idx.dtype == np.int64, f"keep_idx dtype {keep_idx.dtype} != np.int64"
+        assert keep_idx.min() >= 0, f"negative keep index {keep_idx.min()}"
+        assert keep_idx.max() < S, f"padded index detected: {keep_idx.max()} >= S {S}"
+        assert keep_idx[-1] == S - 1, f"must keep last real token {S-1}; got {keep_idx[-1]}"
+
+    # One-line summary (quiet by default)
+    kept_pct = (100.0 * len(keep_idx) / S) if S > 0 else 0.0
+    print(
+        f"[score] S={S} kept={len(keep_idx)} ({kept_pct:.1f}%) "
+        f"prefill_queries={res['shapes']['prefill_queries']} "
+        f"first_key={res['shapes']['first_key']} "
+        f"last_kept={keep_idx[-1] if keep_idx.size else 'NA'}"
+    )
 
 
 if __name__ == "__main__":
