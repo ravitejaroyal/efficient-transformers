@@ -2,6 +2,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Any, Dict, Optional, Tuple, List
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+from QEfficient.generation.text_generation_inference import write_io_files
 
 class BaseInferenceEngine:
     """
@@ -48,71 +49,79 @@ class BaseInferenceEngine:
         return int(min(int(generation_len), int(max_gen_len)))
 
     # --- PREFILL: mirror text_generation_inference.run_prefill ---
-    def run_prefill(
-        self,
-        prompt: str,
-        generation_len: Optional[int] = None,
-        prefill_logit_bs: int = 1,
-        decode_batch_id: Optional[np.ndarray] = None,
-    ) -> Tuple[Dict[str, Any], np.ndarray, int]:
+    def run_prefill(self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None):
         """
         Runs prefill for a given prompt and generation length.
-        Returns: (outputs, position_ids, generation_len)
-        """
 
-        # First pass (padding=True)
+        This method tokenize the prompt and calculates the padded length and number of chunks. Calculates the
+        maximum generation length and fetches the generation length. If a batch index for prefill is provided, it sets the batch index in the inputs. The method then runs prefill for each chunk and updates the inputs and outputs.
+
+        Args:
+            prompt (str): The prompt for which to run prefill.
+            generation_len (int): The generation length.
+            prefill_logit_bs (int, optional): The prefill logit batch size. Defaults to 1.
+
+        Returns:
+            outputs (dict): The outputs of the prefill.
+            position_ids (array): The position IDs.
+            generation_len (int): The generation length.
+        """
+        # Run prefill
         inputs = self._tokenizer(prompt, return_tensors="np", padding=True)
         position_ids = inputs["attention_mask"].sum(1, keepdims=True)
         padded_len = inputs["input_ids"].shape[1]
-        # ceil divide to chunk count
-        num_chunks = -(padded_len // -self._prefill_seq_len)
-        # Convert to a multiple of prefill_seq_len
-        padded_len = num_chunks * self._prefill_seq_len
+        num_chunks = -(padded_len // -self._prefill_seq_len)  # ceil divide without float
+        padded_len = num_chunks * self._prefill_seq_len  # Convert to a multiple of prompt_len
 
-        # Compute generation length parity
+        # Initialize variables specific to request
+        # Calculate the max generation length.
         max_gen_len = self._ctx_len - position_ids.max()
         generation_len = self._fetch_generation_len(generation_len, max_gen_len)
 
-        # Preallocate logits buffer (parity with runtime)
-        try:
-            vocab_size = self._fetch_vocab_size()
-            logits_out_placeholder = np.zeros((prefill_logit_bs, 1, vocab_size), dtype=np.float32)
-            self._session.set_buffers({"logits": logits_out_placeholder})
-        except Exception:
-            pass
+        # Set the prefill logic buffer
+        self._fetch_vocab_size()
+        logits_out_placeholder = np.zeros((prefill_logit_bs, 1, self._vocab_size), dtype=np.float32)
+        self._session.set_buffers({"logits": logits_out_placeholder})
 
-        # Second pass: pad to padded_len and build position_ids with np.where
         inputs = self._tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-        inputs["position_ids"] = np.where(
-            inputs.pop("attention_mask"),
-            np.arange(padded_len, dtype=np.int64),
-            -1
-        )
+        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
         inputs.pop("token_type_ids", None)
 
         if decode_batch_id is not None:
             inputs["batch_index"] = decode_batch_id
 
-        # Chunk loop (same names & slicing)
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
-            chunk_inputs["input_ids"]    = inputs["input_ids"][:,    i*self._prefill_seq_len:(i+1)*self._prefill_seq_len].astype(np.int64, copy=False)
-            chunk_inputs["position_ids"] = inputs["position_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len].astype(np.int64, copy=False)
+            chunk_inputs["input_ids"] = inputs["input_ids"][
+                :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
+            ]
+            chunk_inputs["position_ids"] = inputs["position_ids"][
+                :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
+            ]
             outputs = self._session.run(chunk_inputs)
-
-        return outputs, position_ids, generation_len
+            if self._write_io_dir is not None:
+                write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
+        return (
+            outputs,
+            position_ids,
+            generation_len,
+        )
 
     # --- DECODE: mirror text_generation_inference.run_decode (single-batch, single-step) ---
-    def prepare_decode_inputs(self) -> Dict[str, np.ndarray]:
+    def prepare_decode_inputs(self):
         """
-        Create the decode inputs dict (single-batch, single-step) from self.decode_input_ids/pos.
-        Parity with runtime non-TLM path.
+        This function creates the decode inputs.
+
+        Returns:
+            dict: The decode inputs.
         """
-        if self.decode_input_ids is None or self.decode_pos_ids is None:
-            raise RuntimeError("Call update_decode_seed(...) first to set decode_input_ids/pos.")
-        decode_inputs: Dict[str, np.ndarray] = {}
-        decode_inputs["input_ids"] = self.decode_input_ids.astype(np.int64, copy=False)
-        decode_inputs["position_ids"] = self.decode_pos_ids.astype(np.int64, copy=False)
+        batch_size = self.full_batch_size if self.full_batch_size is not None else self.batch_size
+        decode_inputs = {}
+        decode_inputs["input_ids"] = self.decode_input_ids
+        decode_inputs["position_ids"] = self.decode_pos_ids
+        if self.batch_index is not None:
+            decode_inputs["batch_index"] = self.batch_index
+
         return decode_inputs
 
     def update_decode_seed(self, outputs: Dict[str, Any], position_ids: np.ndarray) -> None:
@@ -127,37 +136,39 @@ class BaseInferenceEngine:
         self.decode_input_ids = next_token_id.astype(np.int64, copy=False)
         self.decode_pos_ids = position_ids.astype(np.int64, copy=False)
 
-    def run_decode(
-        self,
-        decode_inputs: Dict[str, np.ndarray],
-        generation_len: int,
-    ) -> Tuple[int, np.ndarray]:
+    def run_decode(self, decode_inputs, generation_len, streamer: Optional[transformers.TextStreamer] = None):
         """
-        Default method for running decode (single-batch).
-        Returns: (num_token, generated_ids) where generated_ids is [1, generation_len] (including seed).
-        """
-        generated_ids: List[np.ndarray] = []
-        generated_ids.append(decode_inputs["input_ids"][:, -1])
+        Default method for running decode. Executes the decoding process for a given set of inputs and a specified generation length.
 
-        finished_sequences = (decode_inputs["input_ids"] == self._tokenizer.eos_token_id)
+        Enters a loop that continues until all sequences are finished or the maximum generation length is reached. In each iteration, it runs the session with the decode inputs, prepares the inputs for the next iteration and checks if all sequences are finished.
+
+        Args:
+            decode_inputs (dict): The initial inputs for decoding. This should be a dictionary containing 'input_ids' and 'position_ids'.
+            generation_len (int): Max allowed length for generating tokens. The decoding process will be terminated  when generation length is reached.
+            streamer (transformers.TextStreamer): TextStreamer object to print decoded tokens to console.
+        Returns:
+            num_token (int): The number of tokens processed in the decoding process.
+        """
+        finished_sequences = decode_inputs["input_ids"] == self._tokenizer.eos_token_id
         num_token = 0
         for num_token in range(1, generation_len):
+            if streamer:
+                streamer.put(decode_inputs["input_ids"][0])
             outputs = self._session.run(decode_inputs)
-            logits = outputs["logits"]
-            if logits.ndim == 2:
-                logits = np.expand_dims(logits, 1)  # [B,1,V]
-            argmax = logits.argmax(2)                # [B,1]
 
-            # Prepare inputs for next iteration (parity with runtime)
-            decode_inputs["input_ids"] = argmax.astype(np.int64, copy=False)
+            if self._write_io_dir is not None:
+                write_io_files(decode_inputs, outputs, self._write_io_dir, "decode", "aic_batch_io", True, False)
+                self._write_io_dir = None
+
+            # Prepare inputs for next iteration
+            decode_inputs["input_ids"] = outputs["logits"].argmax(2)
             decode_inputs["position_ids"][:, -1] += 1
-            generated_ids.append(argmax[:, -1])
+            self.generated_ids[:, num_token] = decode_inputs["input_ids"][:, -1]
+            finished_sequences |= decode_inputs["input_ids"] == self._tokenizer.eos_token_id
 
-            finished_sequences |= (argmax == self._tokenizer.eos_token_id)
             if finished_sequences.all():
                 break
-
-        return num_token, np.stack(generated_ids, axis=1)
+        return num_token
 
 
 # --------------------- simple __main__ validator ---------------------
