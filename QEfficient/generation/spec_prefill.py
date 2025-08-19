@@ -149,13 +149,29 @@ class SpecPrefillEngine:
         return ex / np.sum(ex, axis=axis, keepdims=True)
 
     def _avg_pool1d_same(self, x: np.ndarray, kernel: int) -> np.ndarray:
-        """Moving-average along last axis with 'same' length via edge padding."""
+        """
+        Moving-average along last axis with 'same' output length.
+        Works for odd or even kernels by asymmetric edge padding.
+        x: [..., S] -> returns [..., S]
+        """
         if kernel is None or kernel <= 1:
             return x
-        pad = kernel // 2
-        xpad = np.pad(x, [(0, 0)] * (x.ndim - 1) + [(pad, pad)], mode="edge")
-        csum = np.cumsum(xpad, axis=-1, dtype=np.float32)
-        out = (csum[..., kernel:] - csum[..., :-kernel]) / float(kernel)
+
+        # Asymmetric padding ensures output length matches input length
+        pad_left = kernel // 2
+        pad_right = kernel - 1 - pad_left  # total padding = kernel - 1
+
+        xpad = np.pad(
+            x,
+            [(0, 0)] * (x.ndim - 1) + [(pad_left, pad_right)],
+            mode="edge",
+        )
+        # Prepend zero for sliding window via cumsum
+        cs = np.cumsum(xpad, axis=-1, dtype=np.float32)
+        zero = np.zeros_like(xpad[..., :1], dtype=np.float32)
+        cs = np.concatenate([zero, cs], axis=-1)
+
+        out = (cs[..., kernel:] - cs[..., :-kernel]) / float(kernel)
         return out
 
     def compute_importance(
@@ -187,7 +203,9 @@ class SpecPrefillEngine:
         scale = 1.0 / math.sqrt(float(D))
         scores = np.einsum("lhd,lhsd->lhs", q, K, optimize=True) * scale
         attn = self._softmax_axis(scores, axis=-1)        # [L,H,S]
-        attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)
+        attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)  # [L,H,S]
+        # Defend against accidental length change
+        assert attn.shape[-1] == S, f"avg_pool1d_same produced length {attn.shape[-1]} != expected {S}"
 
         # Optional numerics check: softmax sums ~1 along last axis
         import os
