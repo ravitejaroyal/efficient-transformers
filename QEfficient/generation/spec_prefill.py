@@ -1,9 +1,20 @@
 from __future__ import annotations
 
-import numpy as np
+import math
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
+import numpy as np
+
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+
+
+@dataclass
+class KeepConfig:
+    strategy: str = "percentage"  # only "percentage" in this step
+    percentage: float = 0.1  # 10%
+    chunk: bool = True
+    chunk_size: int = 32
 
 
 class SpecPrefillEngine:
@@ -130,6 +141,128 @@ class SpecPrefillEngine:
         if not past_keys:
             raise KeyError("No past_key.{i}_RetainedState outputs found in speculator outputs")
         return {"prefill_queries": prefill_queries, "past_keys": past_keys}
+
+    def _softmax_axis(self, x: np.ndarray, axis: int) -> np.ndarray:
+        """Numerically-stable softmax along `axis`."""
+        x = x - np.max(x, axis=axis, keepdims=True)
+        ex = np.exp(x, dtype=np.float32)
+        return ex / np.sum(ex, axis=axis, keepdims=True)
+
+    def _avg_pool1d_same(self, x: np.ndarray, kernel: int) -> np.ndarray:
+        """Moving-average along last axis with 'same' length via edge padding."""
+        if kernel is None or kernel <= 1:
+            return x
+        pad = kernel // 2
+        xpad = np.pad(x, [(0, 0)] * (x.ndim - 1) + [(pad, pad)], mode="edge")
+        csum = np.cumsum(xpad, axis=-1, dtype=np.float32)
+        out = (csum[..., kernel:] - csum[..., :-kernel]) / float(kernel)
+        return out
+
+    def compute_importance(
+        self,
+        prefill_queries: np.ndarray,
+        past_keys: List[np.ndarray],
+        pool_kernel_size: Optional[int] = 13,
+    ) -> np.ndarray:
+        """Compute token-importance [S] for k=0."""
+        q = prefill_queries.astype(np.float32, copy=False)
+        k_list = []
+        for k in past_keys:
+            if k.ndim != 4:
+                raise ValueError(f"past_key must be [1,H_kv,S,D], got {k.shape}")
+            k_list.append(k.squeeze(0))
+        K = np.stack(k_list, axis=0)
+
+        L, H, D = q.shape
+        _, H_kv, S, Dk = K.shape
+        if Dk != D:
+            raise ValueError(f"D mismatch: queries D={D} vs keys D={Dk}")
+
+        if H != H_kv:
+            if H % H_kv != 0:
+                raise ValueError(f"H ({H}) must be multiple of H_kv ({H_kv})")
+            rep = H // H_kv
+            K = np.repeat(K, repeats=rep, axis=1)
+
+        scale = 1.0 / math.sqrt(float(D))
+        scores = np.einsum("lhd,lhsd->lhs", q, K, optimize=True) * scale
+        attn = self._softmax_axis(scores, axis=-1)
+        attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)
+
+        attn_lh = attn.reshape(L * H, S)
+        importance = np.max(attn_lh, axis=0).astype(np.float32, copy=False)
+        return importance
+
+    def select_tokens(self, importance: np.ndarray, keep_cfg: KeepConfig) -> np.ndarray:
+        """Keep indices per policy."""
+        if keep_cfg.strategy != "percentage":
+            raise ValueError(f"Unsupported keep strategy: {keep_cfg.strategy}")
+        S = int(importance.shape[0])
+        must_keep = np.array([S - 1], dtype=np.int64)
+
+        if keep_cfg.chunk:
+            cs = int(keep_cfg.chunk_size)
+            if cs <= 0:
+                raise ValueError("chunk_size must be > 0")
+            n_chunks = (S + cs - 1) // cs
+            chunk_scores = np.empty((n_chunks,), dtype=np.float32)
+            for i in range(n_chunks):
+                start = i * cs
+                end = min((i + 1) * cs, S)
+                chunk_scores[i] = float(np.mean(importance[start:end], dtype=np.float32))
+            k_chunks = max(1, int(math.ceil(n_chunks * keep_cfg.percentage)))
+            keep_chunk_idx = np.argpartition(-chunk_scores, k_chunks - 1)[:k_chunks]
+            keep_chunk_idx.sort()
+            kept_slices = [
+                np.arange(i * cs, min((i + 1) * cs, S), dtype=np.int64)
+                for i in keep_chunk_idx.tolist()
+            ]
+            kept = (
+                np.concatenate(kept_slices, axis=0)
+                if kept_slices
+                else np.empty((0,), dtype=np.int64)
+            )
+        else:
+            k = max(1, int(math.ceil(S * keep_cfg.percentage)))
+            kept = np.argpartition(-importance, k - 1)[:k].astype(np.int64)
+            kept.sort()
+
+        kept = np.unique(np.concatenate([kept, must_keep], axis=0))
+        return kept
+
+    def prefill_and_score(
+        self,
+        prompt: str,
+        *,
+        pool_kernel_size: int = 13,
+        keep_cfg: Optional[KeepConfig] = None,
+    ) -> Dict[str, Any]:
+        """Run spec prefill, compute importance and select keep indices."""
+        if keep_cfg is None:
+            keep_cfg = KeepConfig(
+                strategy="percentage", percentage=0.1, chunk=True, chunk_size=32
+            )
+
+        outputs, position_ids, _ = self.run_prefill(
+            prompt, generation_len=None, prefill_logit_bs=1
+        )
+        tensors = self.collect_for_scoring(outputs)
+        q = tensors["prefill_queries"]
+        keys = tensors["past_keys"]
+        S = int(self._tokenizer(prompt, return_tensors="np")["input_ids"].shape[1])
+
+        imp = self.compute_importance(q, keys, pool_kernel_size=pool_kernel_size)
+        keep_idx = self.select_tokens(imp, keep_cfg)
+
+        return {
+            "importance": imp,
+            "keep_idx": keep_idx,
+            "S": S,
+            "shapes": {
+                "prefill_queries": q.shape,
+                "first_key": keys[0].shape if len(keys) else None,
+            },
+        }
 
 
 # --------------------- simple __main__ validator ---------------------
