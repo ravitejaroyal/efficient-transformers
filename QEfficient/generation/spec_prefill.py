@@ -176,18 +176,25 @@ class SpecPrefillEngine:
 
     def compute_importance(
         self,
-        prefill_queries: np.ndarray,
-        past_keys: List[np.ndarray],
+        prefill_queries: np.ndarray,          # [L,H,D]
+        past_keys: List[np.ndarray],          # len L, each [1,H_kv,S,D]
         pool_kernel_size: Optional[int] = 13,
     ) -> np.ndarray:
         """Compute token-importance [S] for k=0."""
-        q = prefill_queries.astype(np.float32, copy=False)
+        # ---- sanitize inputs (defensive) ----
+        # Convert to float32 and replace NaN/+Inf/-Inf with 0.0 so softmax is well-posed
+        q = np.nan_to_num(
+            prefill_queries.astype(np.float32, copy=False),
+            nan=0.0, posinf=0.0, neginf=0.0
+        )  # [L,H,D]
+
         k_list = []
         for k in past_keys:
             if k.ndim != 4:
                 raise ValueError(f"past_key must be [1,H_kv,S,D], got {k.shape}")
-            k_list.append(k.squeeze(0))
-        K = np.stack(k_list, axis=0)
+            k_list.append(k.squeeze(0))  # [H_kv,S,D]
+        K = np.stack(k_list, axis=0).astype(np.float32, copy=False)  # [L,H_kv,S,D]
+        K = np.nan_to_num(K, nan=0.0, posinf=0.0, neginf=0.0)
 
         L, H, D = q.shape
         _, H_kv, S, Dk = K.shape
@@ -198,13 +205,13 @@ class SpecPrefillEngine:
             if H % H_kv != 0:
                 raise ValueError(f"H ({H}) must be multiple of H_kv ({H_kv})")
             rep = H // H_kv
-            K = np.repeat(K, repeats=rep, axis=1)
+            K = np.repeat(K, repeats=rep, axis=1)  # [L,H,S,D]
 
         scale = 1.0 / math.sqrt(float(D))
         scores = np.einsum("lhd,lhsd->lhs", q, K, optimize=True) * scale
-        attn = self._softmax_axis(scores, axis=-1)        # [L,H,S]
-        attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)  # [L,H,S]
-        # Defend against accidental length change
+        attn = self._softmax_axis(scores, axis=-1)            # [L,H,S]
+        attn = self._avg_pool1d_same(attn, kernel=pool_kernel_size)
+
         assert attn.shape[-1] == S, f"avg_pool1d_same produced length {attn.shape[-1]} != expected {S}"
 
         # Optional numerics check: softmax sums ~1 along last axis
