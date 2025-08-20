@@ -204,6 +204,11 @@ class BaseInferenceEngine:
         """
         finished_sequences = decode_inputs["input_ids"] == self._tokenizer.eos_token_id
         num_token = 0
+        # Allocate generated_ids like runtime setup would do
+        if getattr(self, "generated_ids", None) is None or self.generated_ids.shape != (self.batch_size, int(generation_len)):
+            self.generated_ids = np.zeros((self.batch_size, int(generation_len)), dtype=np.int64)
+        # seed slot 0 with the current token
+        self.generated_ids[:, 0] = decode_inputs["input_ids"][:, -1]
         for num_token in range(1, generation_len):
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
@@ -268,7 +273,7 @@ if __name__ == "__main__":
     # 2) seed decode and run a few steps
     eng.update_decode_seed(outputs, position_ids)
     decode_inputs = eng.prepare_decode_inputs()
-    num_token, gen_ids = eng.run_decode(decode_inputs, generation_len=int(args.gen_len))
-    print(f"[base] ran decode steps: {num_token}  generated_ids shape: {gen_ids.shape}")
+    num_token = eng.run_decode(decode_inputs, generation_len=int(args.gen_len))
+    print(f"[base] ran decode steps: {num_token}")
 
     sys.exit(0)
