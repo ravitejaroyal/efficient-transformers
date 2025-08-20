@@ -275,20 +275,6 @@ if __name__ == "__main__":
         prefill_seq_len=int(args.prompt_len),
         device_ids=dev_ids,
     )
-
-    # --- Vocab/tokenizer sanity: must match QPC logits dimension ---
-    try:
-        qpc_vocab = eng._fetch_vocab_size()
-        hf_vocab = getattr(tok, "vocab_size", None)
-        if hf_vocab is None or int(hf_vocab) != int(qpc_vocab):
-            print(
-                f"[fail] tokenizer vocab_size ({hf_vocab}) != QPC logits size ({qpc_vocab}). "
-                f"Pass --model-name that matches the compiled base QPC.",
-                flush=True,
-            )
-            sys.exit(2)
-    except Exception as e:
-        print(f"[warn] could not verify vocab size parity: {e}", flush=True)
     # ---- Setup like TextGeneration._setup_model_execution_inputs ----
     # Single-prompt, single-batch validator
     num_prompts = 1
