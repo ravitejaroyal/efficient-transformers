@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
+import time
 
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+from QEfficient.generation.base_infer import BaseInferenceEngine
 
 
 @dataclass
@@ -337,6 +339,55 @@ class SpecPrefillEngine:
                 "prefill_queries": q.shape,
                 "first_key": keys_raw[0].shape if len(keys_raw) else None,  # report pre-trim shape for visibility
             },
+        }
+
+    def prune_and_base_prefill(
+        self,
+        base_engine: BaseInferenceEngine,
+        prompt: str,
+        *,
+        pool_kernel_size: int = 13,
+        keep_cfg: Optional[KeepConfig] = None,
+        prefill_logit_bs: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
+        (baseline and pruned) with simple timings.
+        """
+        res = self.prefill_and_score(
+            prompt,
+            pool_kernel_size=pool_kernel_size,
+            keep_cfg=keep_cfg,
+        )
+        keep_idx = res["keep_idx"]
+        S = res["S"]
+        enc = self._tokenizer(prompt, return_tensors="np")
+        final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
+        final_pos = keep_idx.reshape(1, -1).astype(np.int64)
+
+        t0 = time.perf_counter()
+        base_engine.run_prefill(prompt, generation_len=None, prefill_logit_bs=prefill_logit_bs)
+        ttft_baseline_s = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        _, _, padded_len, num_chunks = base_engine.prefill_from_ids(
+            final_ids, final_pos, prefill_logit_bs=prefill_logit_bs
+        )
+        ttft_pruned_s = time.perf_counter() - t1
+
+        print(
+            f"[4.3] S={S} kept={keep_idx.size} "
+            f"TTFT baseline={ttft_baseline_s*1000:.1f}ms pruned={ttft_pruned_s*1000:.1f}ms"
+        )
+
+        return {
+            "S": S,
+            "kept": int(keep_idx.size),
+            "keep_idx": keep_idx,
+            "ttft_baseline_s": ttft_baseline_s,
+            "ttft_pruned_s": ttft_pruned_s,
+            "padded_len_pruned": padded_len,
+            "num_chunks_pruned": num_chunks,
         }
 
 
