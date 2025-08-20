@@ -270,10 +270,23 @@ if __name__ == "__main__":
     if "logits" not in outputs:
         print("[fail] logits missing from prefill outputs"); sys.exit(2)
 
-    # 2) seed decode and run a few steps
+    # 2) seed decode and run a few steps (mirror TGI printing style)
+    # Print the header like text_generation_inference.generate(...)
+    print("\nPrompt : " + args.prompt + "\nCompletion :", flush=True, end="")
     eng.update_decode_seed(outputs, position_ids)
     decode_inputs = eng.prepare_decode_inputs()
     num_token = eng.run_decode(decode_inputs, generation_len=int(args.gen_len))
-    print(f"[base] ran decode steps: {num_token}")
+
+    # Decode generated ids to text (non-streaming path in TGI)
+    # eng.generated_ids shape: [B, generation_len]; we are single-batch here.
+    try:
+        completions = tok.batch_decode(eng.generated_ids, skip_special_tokens=True)
+        # print the first (and only) completion on the same line per TGI
+        if completions:
+            print(completions[0], flush=True)
+    except Exception as e:
+        print(f"\n[warn] could not decode generated_ids: {e}", flush=True)
+
+    print(f"\n[base] ran decode steps: {num_token}")
 
     sys.exit(0)
