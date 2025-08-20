@@ -33,6 +33,10 @@ class BaseInferenceEngine:
         self._vocab_size: Optional[int] = None
         self.batch_size: int = 1            # single-batch helper
         self._decode_seq_len: int = 1       # single-step decode per call
+        # guard attributes referenced by runtime-style code paths
+        self._write_io_dir = None
+        self.full_batch_size = None
+        self.batch_index = None
 
     # --- session probing helpers (runtime parity) ---
     def _fetch_vocab_size(self) -> int:
@@ -106,6 +110,55 @@ class BaseInferenceEngine:
             position_ids,
             generation_len,
         )
+
+    def prefill_from_ids(
+        self,
+        final_ids: np.ndarray,
+        final_pos: np.ndarray,
+        prefill_logit_bs: int = 1,
+    ) -> Tuple[Dict[str, Any], int, int, int]:
+        """
+        Run prefill given prebuilt input_ids and position_ids arrays.
+        Mirrors run_prefill variable names & chunking/padding/dtypes.
+        Returns: (outputs, S, padded_len, num_chunks)
+        """
+        # Ensure shapes/dtypes
+        ids = final_ids.astype(np.int64, copy=False)   # [1,K]
+        pos = final_pos.astype(np.int64, copy=False)   # [1,K] absolute positions
+        S = int(ids.shape[1])
+
+        # ceil divide
+        padded_len = S
+        num_chunks = -(padded_len // -self._prefill_seq_len)
+        padded_len = num_chunks * self._prefill_seq_len
+
+        # Build padded inputs (same policy as tokenizer path)
+        pad_id = getattr(self._tokenizer, "pad_token_id", getattr(self._tokenizer, "eos_token_id", 0))
+        if padded_len > S:
+            pad_width = padded_len - S
+            inputs = {
+                "input_ids":    np.pad(ids, ((0, 0), (0, pad_width)), constant_values=pad_id).astype(np.int64, copy=False),
+                "position_ids": np.pad(pos, ((0, 0), (0, pad_width)), constant_values=-1).astype(np.int64, copy=False),
+            }
+        else:
+            inputs = {"input_ids": ids, "position_ids": pos}
+
+        # Preallocate logits (parity with run_prefill)
+        try:
+            vocab_size = self._fetch_vocab_size()
+            logits_out_placeholder = np.zeros((prefill_logit_bs, 1, vocab_size), dtype=np.float32)
+            self._session.set_buffers({"logits": logits_out_placeholder})
+        except Exception:
+            pass
+
+        # Chunk loop (names & slicing identical)
+        for i in range(num_chunks):
+            chunk_inputs = inputs.copy()
+            chunk_inputs["input_ids"]    = inputs["input_ids"][:,    i*self._prefill_seq_len:(i+1)*self._prefill_seq_len].astype(np.int64, copy=False)
+            chunk_inputs["position_ids"] = inputs["position_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len].astype(np.int64, copy=False)
+            outputs = self._session.run(chunk_inputs)
+
+        return outputs, S, padded_len, num_chunks
 
     # --- DECODE: mirror text_generation_inference.run_decode (single-batch, single-step) ---
     def prepare_decode_inputs(self):
