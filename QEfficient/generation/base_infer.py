@@ -52,6 +52,17 @@ class BaseInferenceEngine:
             return int(max_gen_len)
         return int(min(int(generation_len), int(max_gen_len)))
 
+    # --- Allocate decode buffers like TextGeneration.initialize_decode_inputs ---
+    def initialize_decode_inputs(self, num_prompts: int, execution_batch_size: int, max_gen_length: int) -> None:
+        """
+        Initialize np arrays for storing the prefill output for all the decode batch size.
+        (Parity with QEfficient/generation/text_generation_inference.py lines 608–615.)
+        """
+        self.generated_ids = np.full((num_prompts, int(max_gen_length)), self._tokenizer.pad_token_id)
+        self.decode_input_ids = np.zeros((execution_batch_size, 1), np.int64)
+        self.decode_pos_ids = np.zeros((execution_batch_size, 1), np.int64)
+        self.generation_len = np.zeros((execution_batch_size, 1), np.int64)
+
     # --- PREFILL: mirror text_generation_inference.run_prefill ---
     def run_prefill(self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None):
         """
@@ -88,7 +99,8 @@ class BaseInferenceEngine:
         self._session.set_buffers({"logits": logits_out_placeholder})
 
         inputs = self._tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
+        # dtype parity: int64 everywhere
+        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len, dtype=np.int64), -1)
         inputs.pop("token_type_ids", None)
 
         if decode_batch_id is not None:
@@ -96,12 +108,13 @@ class BaseInferenceEngine:
 
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
+            # cast to int64 like the spec path does
             chunk_inputs["input_ids"] = inputs["input_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-            ]
+            ].astype(np.int64, copy=False)
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-            ]
+            ].astype(np.int64, copy=False)
             outputs = self._session.run(chunk_inputs)
             if self._write_io_dir is not None:
                 write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
@@ -204,11 +217,11 @@ class BaseInferenceEngine:
         """
         finished_sequences = decode_inputs["input_ids"] == self._tokenizer.eos_token_id
         num_token = 0
-        # Allocate generated_ids like runtime setup would do
+        # Allocate like TextGeneration setup would do (single batch validator)
         if getattr(self, "generated_ids", None) is None or self.generated_ids.shape != (self.batch_size, int(generation_len)):
-            self.generated_ids = np.zeros((self.batch_size, int(generation_len)), dtype=np.int64)
-        # seed slot 0 with the current token
-        self.generated_ids[:, 0] = decode_inputs["input_ids"][:, -1]
+            self.generated_ids = np.full((self.batch_size, int(generation_len)), self._tokenizer.pad_token_id)
+            # seed slot 0 so batch_decode returns something deterministic
+            self.generated_ids[:, 0] = decode_inputs["input_ids"][:, -1]
         for num_token in range(1, generation_len):
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
@@ -262,8 +275,15 @@ if __name__ == "__main__":
         prefill_seq_len=int(args.prompt_len),
         device_ids=dev_ids,
     )
+    # ---- Setup like TextGeneration._setup_model_execution_inputs ----
+    # Single-prompt, single-batch validator
+    num_prompts = 1
+    execution_batch_size = eng.batch_size
+    max_gen_length = max(int(args.ctx_len), int(args.gen_len))
+    eng.initialize_decode_inputs(num_prompts, execution_batch_size, max_gen_length)
 
-    # 1) prefill
+    # 1) prefill (parity with TGI: print header, then run)
+    print("\nPrompt : " + args.prompt + "\nCompletion :", flush=True, end="")
     outputs, position_ids, generation_len = eng.run_prefill(
         args.prompt, generation_len=None, prefill_logit_bs=args.prefill_logit_bs
     )
@@ -271,21 +291,26 @@ if __name__ == "__main__":
         print("[fail] logits missing from prefill outputs"); sys.exit(2)
 
     # 2) seed decode and run a few steps (mirror TGI printing style)
-    # Print the header like text_generation_inference.generate(...)
-    print("\nPrompt : " + args.prompt + "\nCompletion :", flush=True, end="")
     eng.update_decode_seed(outputs, position_ids)
     decode_inputs = eng.prepare_decode_inputs()
     num_token = eng.run_decode(decode_inputs, generation_len=int(args.gen_len))
 
-    # Decode generated ids to text (non-streaming path in TGI)
-    # eng.generated_ids shape: [B, generation_len]; we are single-batch here.
-    try:
-        completions = tok.batch_decode(eng.generated_ids, skip_special_tokens=True)
-        # print the first (and only) completion on the same line per TGI
-        if completions:
-            print(completions[0], flush=True)
-    except Exception as e:
-        print(f"\n[warn] could not decode generated_ids: {e}", flush=True)
+    import os
+    # Optional: dump ids/tokens before decoding for parity debugging
+    if os.getenv("QEFF_BASE_DEBUG", ""):
+        n = max(1, min(int(args.gen_len), 32))
+        ids_dump = eng.generated_ids[0, :n].tolist()
+        print(f"\n[debug] gen_ids[:{len(ids_dump)}]:", ids_dump)
+        try:
+            toks = tok.convert_ids_to_tokens(ids_dump)
+            print(f"[debug] tokens[:{len(toks)}]:", toks)
+        except Exception as e:
+            print(f"[debug] token conversion error: {e}")
+
+    # Decode generated ids to text (TGI non-streaming path)
+    completions = tok.batch_decode(eng.generated_ids, skip_special_tokens=True)
+    if completions:
+        print(completions[0], flush=True)
 
     print(f"\n[base] ran decode steps: {num_token}")
 
