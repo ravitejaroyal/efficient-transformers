@@ -58,7 +58,9 @@ class BaseInferenceEngine:
         Initialize np arrays for storing the prefill output for all the decode batch size.
         (Parity with QEfficient/generation/text_generation_inference.py lines 608–615.)
         """
-        self.generated_ids = np.full((num_prompts, int(max_gen_length)), self._tokenizer.pad_token_id)
+        self.generated_ids = np.full(
+            (num_prompts, int(max_gen_length)), self._tokenizer.pad_token_id, dtype=np.int64
+        )
         self.decode_input_ids = np.zeros((execution_batch_size, 1), np.int64)
         self.decode_pos_ids = np.zeros((execution_batch_size, 1), np.int64)
         self.generation_len = np.zeros((execution_batch_size, 1), np.int64)
@@ -190,7 +192,9 @@ class BaseInferenceEngine:
 
         return decode_inputs
 
-    def update_decode_seed(self, outputs: Dict[str, Any], position_ids: np.ndarray) -> None:
+    def update_decode_seed(
+        self, outputs: Dict[str, Any], position_ids: np.ndarray, generation_len: int
+    ) -> None:
         """
         Seed the first decode step using prefill outputs (parity with update_decode_input).
         """
@@ -201,6 +205,10 @@ class BaseInferenceEngine:
         # Store the generated values
         self.decode_input_ids = next_token_id.astype(np.int64, copy=False)
         self.decode_pos_ids = position_ids.astype(np.int64, copy=False)
+        self.generated_ids[:, 0] = next_token_id.squeeze(1)
+        self.generation_len[:] = np.array(generation_len, dtype=np.int64).reshape(
+            self.batch_size, 1
+        )
 
     def run_decode(self, decode_inputs, generation_len, streamer: Optional[transformers.TextStreamer] = None):
         """
@@ -217,11 +225,6 @@ class BaseInferenceEngine:
         """
         finished_sequences = decode_inputs["input_ids"] == self._tokenizer.eos_token_id
         num_token = 0
-        # Allocate like TextGeneration setup would do (single batch validator)
-        if getattr(self, "generated_ids", None) is None or self.generated_ids.shape != (self.batch_size, int(generation_len)):
-            self.generated_ids = np.full((self.batch_size, int(generation_len)), self._tokenizer.pad_token_id)
-            # seed slot 0 so batch_decode returns something deterministic
-            self.generated_ids[:, 0] = decode_inputs["input_ids"][:, -1]
         for num_token in range(1, generation_len):
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
@@ -232,7 +235,8 @@ class BaseInferenceEngine:
                 self._write_io_dir = None
 
             # Prepare inputs for next iteration
-            decode_inputs["input_ids"] = outputs["logits"].argmax(2)
+            logits = outputs["logits"]
+            decode_inputs["input_ids"] = logits.argmax(2)
             decode_inputs["position_ids"][:, -1] += 1
             self.generated_ids[:, num_token] = decode_inputs["input_ids"][:, -1]
             finished_sequences |= decode_inputs["input_ids"] == self._tokenizer.eos_token_id
@@ -291,9 +295,9 @@ if __name__ == "__main__":
         print("[fail] logits missing from prefill outputs"); sys.exit(2)
 
     # 2) seed decode and run a few steps (mirror TGI printing style)
-    eng.update_decode_seed(outputs, position_ids)
+    eng.update_decode_seed(outputs, position_ids, generation_len)
     decode_inputs = eng.prepare_decode_inputs()
-    num_token = eng.run_decode(decode_inputs, generation_len=int(args.gen_len))
+    num_token = eng.run_decode(decode_inputs, generation_len=int(generation_len))
 
     import os
     # Optional: dump ids/tokens before decoding for parity debugging
@@ -308,9 +312,9 @@ if __name__ == "__main__":
             print(f"[debug] token conversion error: {e}")
 
     # Decode generated ids to text (TGI non-streaming path)
-    completions = tok.batch_decode(eng.generated_ids, skip_special_tokens=True)
-    if completions:
-        print(completions[0], flush=True)
+    generated_texts = tok.batch_decode(eng.generated_ids, skip_special_tokens=True)
+    if generated_texts:
+        print(generated_texts[0], flush=True)
 
     print(f"\n[base] ran decode steps: {num_token}")
 
