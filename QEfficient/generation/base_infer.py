@@ -1076,13 +1076,17 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default=None, help="Prompt string")
     parser.add_argument("--prompts-txt-file-path", type=str, default=None, help="Path to prompts txt file")
     parser.add_argument("--device-id", type=str, default=None, help="Device IDs as comma-separated string, e.g. 0,1")
-    parser.add_argument("--generation-len", type=int, default=16, help="Number of tokens to generate")
+    parser.add_argument("--generation-len", type=int, default=None, help="Number of tokens to generate")
     parser.add_argument("--enable-debug-logs", action="store_true", help="Enable debug logs")
-    parser.add_argument("--stream", action="store_true", help="Enable streaming output")
+    parser.add_argument(
+        "--stream", action="store_true", default=True, help="Enable streaming output"
+    )
     parser.add_argument("--write-io-dir", type=str, default=None, help="Directory to write IO files")
     parser.add_argument("--automation", action="store_true", help="Automation mode")
-    parser.add_argument("--prompt-to-lora-id-mapping", type=str, default=None, help="Comma-separated LoRA IDs")
-    parser.add_argument("--is-tlm", action="store_true", help="TRLM model")
+    parser.add_argument(
+        "--prompt-to-lora-id-mapping", type=str, default=None, help="Comma-separated LoRA IDs"
+    )
+    parser.add_argument("--is-tlm", action="store_true", help="Is tlm module")
 
     args = parser.parse_args()
 
