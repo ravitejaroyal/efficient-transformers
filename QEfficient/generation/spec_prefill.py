@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Union
 
 import numpy as np
 import time
 
 from QEfficient.generation.cloud_infer import QAICInferenceSession
-from QEfficient.generation.base_infer import BaseInferenceEngine
+from QEfficient.generation.base_infer import write_io_files
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+from QEfficient.utils.logging_utils import logger
 
 
 @dataclass
@@ -28,95 +30,169 @@ class SpecPrefillEngine:
 
     def __init__(
         self,
-        spec_qpc_path: str,
-        tokenizer,
-        ctx_len: int,
-        prefill_seq_len: int,
-        device_ids: Optional[List[int]] = None,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+        qpc_path: str,
+        full_batch_size: Optional[int] = None,
+        ctx_len: Optional[int] = None,
+        device_id: Optional[List[int]] = None,
+        enable_debug_logs: bool = False,
+        write_io_dir: Optional[str] = None,
+        is_tlm: Optional[int] = None,
     ) -> None:
-        self._session = QAICInferenceSession(spec_qpc_path, device_ids=device_ids)
-        self._tokenizer = tokenizer
-        # _set_tokenizer_params parity
-        if getattr(self._tokenizer, "padding_side", "right") != "right":
-            self._tokenizer.padding_side = "right"
-        if getattr(self._tokenizer, "pad_token_id", None) is None:
-            self._tokenizer.pad_token_id = getattr(self._tokenizer, "eos_token_id", 0)
-        self._ctx_len = int(ctx_len)
-        self._prefill_seq_len = int(prefill_seq_len)
-        self._vocab_size: Optional[int] = None
+        self._ctx_len = ctx_len
+        self._write_io_dir = write_io_dir
+        self.is_tlm = is_tlm
+
+        # Load QPC
+        self._session = QAICInferenceSession(qpc_path, device_id, enable_debug_logs=enable_debug_logs)
+
+        # Fetch variables from the QPC
+        self._vocab_size = self._fetch_vocab_size()
+        self.batch_size, self._prefill_seq_len = self._fetch_batch_size_prefill_seq_len()
+        self._decode_seq_len = self._fetch_decode_seq_len()
+        self.full_batch_size = full_batch_size if full_batch_size else self._fetch_full_batch_size()
+
+        # Initialize storage variables
+        self.batch_index = None
+        self._prompt_to_lora_id_mapping_prefill = None
+        self._prompt_to_lora_id_mapping_decode = None
+        self.generated_ids = None
+        self.decode_input_ids = None
+        self.decode_pos_ids = None
+        self.generation_len = None
+
+        self.tokenizer = tokenizer
+        self._set_tokenizer_params()
+
+        self._session.skip_buffers(
+            [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
+        )
+
+    def _set_tokenizer_params(self):
+        """
+        Sets the tokenizer parameters for the model.
+        """
+        if self.tokenizer.padding_side != "right":
+            logger.warning("Please use padding_side='right' while initializing the tokenizer")
+            self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
     # --- session probing helpers (runtime parity) ---
-    def _fetch_vocab_size(self) -> int:
-        if self._vocab_size is not None:
+    def _fetch_vocab_size(self):
+        """Fetches and caches the vocabulary size from the session's allowed shapes."""
+        if getattr(self, "_vocab_size", None) is not None:
             return self._vocab_size
-        bidx = self._session.binding_index_map["logits"]
-        dims = list(self._session.bindings[bidx].dims)
-        self._vocab_size = int(dims[-1])
+        if self._session.allowed_shapes:
+            self._vocab_size = [
+                x[self._session.binding_index_map["logits"]] for x in self._session.allowed_shapes
+            ][0][1][2]
+        else:
+            self._vocab_size = self._session.bindings[self._session.binding_index_map["logits"]].dims[2]
         return self._vocab_size
 
-    def _fetch_generation_len(self, generation_len: Optional[int], max_gen_len: int) -> int:
+    def _fetch_batch_size_prefill_seq_len(self):
+        """Fetches batch size and prefill sequence length from the session."""
+        if self._session.allowed_shapes:
+            batch_size = max(
+                [x[self._session.binding_index_map["input_ids"]][1][0] for x in self._session.allowed_shapes]
+            )
+            prefill_seq_len = max(
+                [x[self._session.binding_index_map["input_ids"]][1][1] for x in self._session.allowed_shapes]
+            )
+        else:
+            batch_size, prefill_seq_len = self._session.bindings[
+                self._session.binding_index_map["input_ids"]
+            ].dims
+        return batch_size, prefill_seq_len
+
+    def _fetch_decode_seq_len(self):
+        """Fetches decode sequence length from the session."""
+        decode_seq_len = None
+        if self._session.allowed_shapes:
+            decode_seq_len = min(
+                [x[self._session.binding_index_map["input_ids"]][1][1] for x in self._session.allowed_shapes]
+            )
+        return decode_seq_len
+
+    def _fetch_full_batch_size(self):
+        """Fetches full batch size from the session."""
+        full_batch_size = None
+        if "batch_index" in self._session.binding_index_map:
+            if self._session.allowed_shapes:
+                full_batch_size, _ = [
+                    x[self._session.binding_index_map["batch_index"]][1][0] for x in self._session.allowed_shapes
+                ]
+            else:
+                full_batch_size, _ = self._session.bindings[
+                    self._session.binding_index_map["batch_index"]
+                ].dims
+        return full_batch_size
+
+    def _fetch_generation_len(self, generation_len, max_gen_len):
+        """Fetches the generation length for the model."""
         if generation_len is None:
-            return int(max_gen_len)
-        return int(min(int(generation_len), int(max_gen_len)))
+            if self._ctx_len is None:
+                raise ValueError("At least one of ctx_len or generation_len is needed")
+            generation_len = max_gen_len
+        elif generation_len > max_gen_len:
+            logger.warning(
+                "Passed generation_len is greater than allowed length. "
+                "Make sure this model supports sliding window, such as Mistral"
+            )
+        if generation_len <= 0:
+            raise ValueError("generation length should be greater than zero")
+        return generation_len
 
     # --- PREFILL: identical variable names & logic ---
-    def run_prefill(
-        self,
-        prompt: str,
-        generation_len: Optional[int] = None,
-        prefill_logit_bs: int = 1,
-        decode_batch_id: Optional[np.ndarray] = None,
-    ) -> Tuple[Dict[str, Any], np.ndarray, int]:
-        """
-        Runs prefill for a given prompt and generation length (speculator).
-        Returns: (outputs, position_ids, generation_len) from the last chunk.
-        """
-
-        # First pass (padding=True)
-        inputs = self._tokenizer(prompt, return_tensors="np", padding=True)
+    def run_prefill(self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None):
+        """Runs prefill for a given prompt and generation length."""
+        inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
         position_ids = inputs["attention_mask"].sum(1, keepdims=True)
         padded_len = inputs["input_ids"].shape[1]
-        # ceil divide to chunk count
         num_chunks = -(padded_len // -self._prefill_seq_len)
-        # Convert to a multiple of prefill_len
         padded_len = num_chunks * self._prefill_seq_len
 
-        # Compute generation length parity
         max_gen_len = self._ctx_len - position_ids.max()
         generation_len = self._fetch_generation_len(generation_len, max_gen_len)
 
-        # Preallocate logits buffer (parity with runtime)
-        try:
-            vocab_size = self._fetch_vocab_size()
-            logits_out_placeholder = np.zeros((prefill_logit_bs, 1, vocab_size), dtype=np.float32)
-            self._session.set_buffers({"logits": logits_out_placeholder})
-        except Exception:
-            pass
+        logits_out_placeholder = np.zeros((prefill_logit_bs, 1, self._vocab_size), dtype=np.float32)
+        self._session.set_buffers({"logits": logits_out_placeholder})
 
-        # Second pass: padding="max_length" and build position_ids via np.where
-        inputs = self._tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-        inputs["position_ids"] = np.where(
-            inputs.pop("attention_mask"),
-            np.arange(padded_len, dtype=np.int64),
-            -1,
-        )
+        inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
+        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
         inputs.pop("token_type_ids", None)
 
         if decode_batch_id is not None:
             inputs["batch_index"] = decode_batch_id
-        # NOTE: no TLM/LoRA extras in speculator path.
+        if self.is_tlm:
+            inputs["num_logits_to_keep"] = np.zeros((1, 1))
 
-        # Chunk loop (names & slicing identical)
+        if self._prompt_to_lora_id_mapping_prefill:
+            if self.full_batch_size:
+                inputs["lora_ids"] = np.array(
+                    self._prompt_to_lora_id_mapping_prefill.popleft(), dtype=np.int64
+                ).reshape(1, 1)
+            else:
+                batch_lora_ids = [self._prompt_to_lora_id_mapping_prefill.popleft() for i in range(self.batch_size)]
+                inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(self.batch_size, 1)
+
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
             chunk_inputs["input_ids"] = inputs["input_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-            ].astype(np.int64, copy=False)
+            ]
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-            ].astype(np.int64, copy=False)
+            ]
             outputs = self._session.run(chunk_inputs)
+            if self._write_io_dir is not None:
+                write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
 
+        last_logits = outputs["logits"][0, -1]
+        token_id = int(last_logits.argmax())
+        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+        print(f"Prefill last token: {token_text}", flush=True)
         return outputs, position_ids, generation_len
 
     # --- helper to collect tensors for scoring from a prefill 'outputs' dict ---
