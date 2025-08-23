@@ -70,13 +70,14 @@ class SpecPrefillEngine:
         self.tokenizer = tokenizer
         self._set_tokenizer_params()
 
-        self._session.skip_buffers(
-            [
-                x
-                for x in self._session.input_names + self._session.output_names
-                if x.startswith("past_")
-            ]
-        )
+        # Speculative prefill relies on past_key.* outputs for scoring, so only
+        # skip past inputs and past_value.* outputs. This preserves the
+        # retained key states while dropping value caches.
+        past_inputs = [n for n in self._session.input_names if n.startswith("past_")]
+        past_val_outs = [
+            n for n in self._session.output_names if n.startswith("past_value.")
+        ]
+        self._session.skip_buffers(past_inputs + past_val_outs)
 
     def _set_tokenizer_params(self):
         """
