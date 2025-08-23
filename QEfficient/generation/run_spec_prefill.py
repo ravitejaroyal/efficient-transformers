@@ -26,7 +26,11 @@ def main() -> None:
     )
     parser.add_argument("--ctx-len", type=int, default=128, help="Context length used by both engines.")
     parser.add_argument("--gen-len", type=int, default=16, help="Decode steps for parity check.")
-    parser.add_argument("--device-ids", default="[0]", help="Device IDs like [0] or [0,1].")
+    # Separate device groups for speculator and base engines
+    parser.add_argument("--spec-device-ids", default="[0]",
+                        help="Speculator device IDs, e.g. [0] or [0,1]")
+    parser.add_argument("--base-device-ids", default="[0]",
+                        help="Base model device IDs, e.g. [1] or [2,3]")
     parser.add_argument(
         "--keep-percentage",
         type=float,
@@ -43,25 +47,30 @@ def main() -> None:
 
     os.environ.setdefault("QEFF_SPEC_DEBUG", "1")
 
-    try:
-        device_ids: Optional[List[int]] = [
-            int(x) for x in args.device_ids.strip("[] ").split(",") if x.strip()
-        ]
-    except Exception:
-        device_ids = [0]
+    # ---- Parse device lists (accepts "[0,1]" or "0,1" or "[0]") ----
+    def _parse_ids(s: Optional[str]) -> List[int]:
+        if not s:
+            return [0]
+        parts = s.strip().strip("[]").split(",")
+        ids = [int(p) for p in parts if p.strip() != ""]
+        return ids if ids else [0]
+
+    spec_device_ids: List[int] = _parse_ids(args.spec_device_ids)
+    base_device_ids: List[int] = _parse_ids(args.base_device_ids)
+    print(f"[devices] spec={spec_device_ids}  base={base_device_ids}")
 
     tokenizer = load_hf_tokenizer(pretrained_model_name_or_path=args.model_name)
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
         qpc_path=args.spec_qpc,
         ctx_len=int(args.ctx_len),
-        device_id=device_ids,
+        device_id=spec_device_ids,
     )
     base = TextGeneration(
         tokenizer=tokenizer,
         qpc_path=args.base_qpc,
         ctx_len=int(args.ctx_len),
-        device_id=device_ids,
+        device_id=base_device_ids,
     )._qaic_model
 
     print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
