@@ -775,6 +775,27 @@ class QEffTextGenerationBase:
                     True,
                     False,
                 )
+        # ---- debug-only prefill summary for parity with spec path ----
+        try:
+            import os
+            if os.getenv("QEFF_BASE_DEBUG"):
+                orig_seq_len = int(position_ids.max())
+                logits = outputs.get("logits", None)
+                logits_shape = None if logits is None else tuple(getattr(logits, "shape", ()))
+                # Print next-token argmax at the final prefill position
+                next_tok = None
+                if logits is not None:
+                    if logits.ndim == 2:
+                        # [B,V] -> [B,1,V]
+                        import numpy as _np
+                        logits = _np.expand_dims(logits, 1)
+                    next_tok = int(logits.argmax(2)[0, 0])
+                print(
+                    f"[base:prefill] orig_seq_len={orig_seq_len} padded_len={padded_len} chunks={num_chunks} "
+                    f"logits={logits_shape} next_tok={next_tok}"
+                )
+        except Exception:
+            pass
         return (
             outputs,
             position_ids,
