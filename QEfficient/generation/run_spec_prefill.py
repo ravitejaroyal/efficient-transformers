@@ -26,6 +26,8 @@ def main() -> None:
     )
     parser.add_argument("--ctx-len", type=int, default=128, help="Context length used by both engines.")
     parser.add_argument("--gen-len", type=int, default=16, help="Decode steps for parity check.")
+    parser.add_argument("--prompt-file", type=str, default=None,
+                        help="Read the entire file as a single prompt (e.g., a 100k-token prompt). If set, overrides --prompt.")
     # Separate device groups for speculator and base engines
     parser.add_argument("--spec-device-ids", default="[0]",
                         help="Speculator device IDs, e.g. [0] or [0,1]")
@@ -60,6 +62,12 @@ def main() -> None:
     print(f"[devices] spec={spec_device_ids}  base={base_device_ids}")
 
     tokenizer = load_hf_tokenizer(pretrained_model_name_or_path=args.model_name)
+    # Load prompt: either raw string from --prompt or full file content from --prompt-file
+    if args.prompt_file:
+        with open(args.prompt_file, "r", encoding="utf-8") as fh:
+            prompt_text = fh.read()
+    else:
+        prompt_text = args.prompt
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
         qpc_path=args.spec_qpc,
@@ -75,10 +83,10 @@ def main() -> None:
 
     print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
     out_full, pos_ids, gen_len = base.run_prefill(
-        [args.prompt], generation_len=int(args.gen_len), prefill_logit_bs=1
+        [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
     )
     orig_seq_len = int(pos_ids.max())
-    enc_full = tokenizer(args.prompt, return_tensors="np")
+    enc_full = tokenizer(prompt_text, return_tensors="np")
     ids_full = enc_full["input_ids"][:, :orig_seq_len]
     pos_full = np.arange(orig_seq_len, dtype=np.int64).reshape(1, -1)
 
@@ -100,7 +108,7 @@ def main() -> None:
     )
     ret = spec.prune_and_base_prefill(
         base_engine=base,
-        prompt=args.prompt,
+        prompt=prompt_text,
         pool_kernel_size=13,
         keep_cfg=keep_cfg,
         prefill_logit_bs=1,
