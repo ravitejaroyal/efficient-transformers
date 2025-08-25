@@ -242,7 +242,7 @@ class SpecPrefillEngine:
         import os
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
-            print(f"Prefill last token: {token_text}", flush=True)
+            print(f"[base:prefill] final token: {token_text!r}", flush=True)
         return outputs, position_ids, generation_len
 
     # --- helper to collect tensors for scoring from a prefill 'outputs' dict ---

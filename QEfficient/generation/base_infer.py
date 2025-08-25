@@ -800,7 +800,7 @@ class QEffTextGenerationBase:
                     )
                 print(
                     f"[base:prefill] orig_seq_len={orig_seq_len} padded_len={padded_len} chunks={num_chunks} "
-                    f"logits={logits_shape} next_tok_id={next_tok} next_tok_text={next_tok_text}"
+                    f"logits={logits_shape} next_tok_id={next_tok} next_tok_text={next_tok_text!r}"
                 )
         except Exception:
             pass
