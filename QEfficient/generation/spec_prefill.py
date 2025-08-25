@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -70,13 +70,9 @@ class SpecPrefillEngine:
         self.tokenizer = tokenizer
         self._set_tokenizer_params()
 
-        # Speculative prefill relies on past_key.* outputs for scoring, so only
-        # skip past inputs and past_value.* outputs. This preserves the
-        # retained key states while dropping value caches.
+        # Speculative prefill needs past_key.* for scoring; skip only past_value.* to reduce host IO.
         past_inputs = [n for n in self._session.input_names if n.startswith("past_")]
-        past_val_outs = [
-            n for n in self._session.output_names if n.startswith("past_value.")
-        ]
+        past_val_outs = [n for n in self._session.output_names if n.startswith("past_value.")]
         self._session.skip_buffers(past_inputs + past_val_outs)
 
     def _set_tokenizer_params(self):
@@ -242,7 +238,7 @@ class SpecPrefillEngine:
         import os
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
-            print(f"[base:prefill] final token: {token_text!r}", flush=True)
+            print(f"[spec:prefill] final token: {token_text!r}", flush=True)
         return outputs, position_ids, generation_len
 
     # --- helper to collect tensors for scoring from a prefill 'outputs' dict ---
@@ -277,6 +273,18 @@ class SpecPrefillEngine:
         x = x - np.max(x, axis=axis, keepdims=True)
         ex = np.exp(x, dtype=np.float32)
         return ex / np.sum(ex, axis=axis, keepdims=True)
+
+    # ---- helper: get last token id+text from a prefill outputs dict ----
+    @staticmethod
+    def _next_token_from_outputs(outputs: Dict[str, Any], tokenizer) -> Tuple[Optional[int], Optional[str]]:
+        logits = outputs.get("logits", None)
+        if logits is None:
+            return None, None
+        if logits.ndim == 2:
+            logits = np.expand_dims(logits, 1)  # [B,V] -> [B,1,V]
+        tok_id = int(logits.argmax(2)[0, 0])
+        tok_text = tokenizer.decode([tok_id], skip_special_tokens=True)
+        return tok_id, tok_text
 
     def _avg_pool1d_same(self, x: np.ndarray, kernel: int) -> np.ndarray:
         """
@@ -422,6 +430,8 @@ class SpecPrefillEngine:
         outputs, position_ids, _ = self.run_prefill(
             prompt, generation_len=None, prefill_logit_bs=1
         )
+        # Spec prefill last token (id/text) for comparison
+        spec_last_tok_id, spec_last_tok_text = self._next_token_from_outputs(outputs, self.tokenizer)
 
         # Extract tensors for scoring
         tensors = self.collect_for_scoring(outputs)
@@ -481,6 +491,7 @@ class SpecPrefillEngine:
                 f"[spec:score] orig_seq_len={orig_seq_len} capacity_seq_len={capacity_seq_len} "
                 f"imp_len={imp.shape[0]} kept={len(keep_idx)} ({kept_pct:.1f}%)"
             )
+            print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
 
         return {
             "importance": imp,  # length orig_seq_len
@@ -492,6 +503,8 @@ class SpecPrefillEngine:
                     keys_raw[0].shape if len(keys_raw) else None
                 ),  # report pre-trim shape for visibility
             },
+            "spec_last_tok_id": spec_last_tok_id,
+            "spec_last_tok_text": spec_last_tok_text,
         }
 
     def prune_and_base_prefill(
@@ -507,13 +520,19 @@ class SpecPrefillEngine:
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
         (baseline and pruned) with simple timings.
         """
+        # ---- TTFT(spec_only): spec prefill + score + select ----
+        t_spec_start = time.perf_counter()
         res = self.prefill_and_score(
             prompt,
             pool_kernel_size=pool_kernel_size,
             keep_cfg=keep_cfg,
         )
+        t_spec_end = time.perf_counter()
+        ttft_spec_only_s = t_spec_end - t_spec_start
         keep_idx = res["keep_idx"]
         orig_seq_len = res["orig_seq_len"]
+        spec_last_tok_id = res.get("spec_last_tok_id")
+        spec_last_tok_text = res.get("spec_last_tok_text")
         enc = self.tokenizer(prompt, return_tensors="np")
         final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
         final_pos = keep_idx.reshape(1, -1).astype(np.int64)
@@ -540,31 +559,61 @@ class SpecPrefillEngine:
         except Exception:
             pass
 
+        # ---- TTFT(base_full): baseline base prefill on full prompt ----
         t0 = time.perf_counter()
-        base_engine.run_prefill(
+        out_base_full, pos_full, _ = base_engine.run_prefill(
             prompt, generation_len=None, prefill_logit_bs=prefill_logit_bs
         )
         ttft_baseline_s = time.perf_counter() - t0
 
+        # ---- TTFT(base_pruned_only): base prefill on pruned ids/pos ----
         t1 = time.perf_counter()
-        _, _, padded_len, num_chunks = base_engine.prefill_from_ids(
+        out_base_pruned, _, padded_len, num_chunks = base_engine.prefill_from_ids(
             final_ids, final_pos, prefill_logit_bs=prefill_logit_bs
         )
-        ttft_pruned_s = time.perf_counter() - t1
+        t2 = time.perf_counter()
+        ttft_base_pruned_only_s = t2 - t1
+        ttft_speculative_s = ttft_spec_only_s + ttft_base_pruned_only_s
 
+        # Always print a compact TTFT summary (ms)
         print(
             f"[4.3] orig_seq_len={orig_seq_len} kept={keep_idx.size} "
-            f"TTFT baseline={ttft_baseline_s*1000:.1f}ms pruned={ttft_pruned_s*1000:.1f}ms"
+            f"TTFT(base_full)={ttft_baseline_s*1000:.1f}ms  "
+            f"TTFT(spec_only)={ttft_spec_only_s*1000:.1f}ms  "
+            f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms  "
+            f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
         )
+
+        # Debug: print spec and base last tokens for direct comparison
+        try:
+            import os
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                base_full_id, base_full_text = self._next_token_from_outputs(out_base_full, self.tokenizer)
+                base_pruned_id, base_pruned_text = self._next_token_from_outputs(out_base_pruned, self.tokenizer)
+                print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
+                print(
+                    f"[base:last] full_id={base_full_id} full_text={base_full_text!r}  "
+                    f"pruned_id={base_pruned_id} pruned_text={base_pruned_text!r}"
+                )
+        except Exception:
+            pass
 
         return {
             "orig_seq_len": orig_seq_len,
             "kept": int(keep_idx.size),
             "keep_idx": keep_idx,
             "ttft_baseline_s": ttft_baseline_s,
-            "ttft_pruned_s": ttft_pruned_s,
+            "ttft_spec_only_s": ttft_spec_only_s,
+            "ttft_base_pruned_only_s": ttft_base_pruned_only_s,
+            "ttft_speculative_s": ttft_speculative_s,
             "padded_len_pruned": padded_len,
             "num_chunks_pruned": num_chunks,
+            "spec_last_tok_id": spec_last_tok_id,
+            "spec_last_tok_text": spec_last_tok_text,
+            "base_last_full_id": base_full_id if 'base_full_id' in locals() else None,
+            "base_last_full_text": base_full_text if 'base_full_text' in locals() else None,
+            "base_last_pruned_id": base_pruned_id if 'base_pruned_id' in locals() else None,
+            "base_last_pruned_text": base_pruned_text if 'base_pruned_text' in locals() else None,
         }
 
 

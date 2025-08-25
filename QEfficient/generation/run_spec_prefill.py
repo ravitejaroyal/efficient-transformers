@@ -91,56 +91,21 @@ def main() -> None:
         f"[unit] OK  orig_seq_len={seq_len_ret}  padded_len={padded_len}  num_chunks={num_chunks}"
     )
 
-    print(
-        "\n[2/2] Integration: spec prefill → importance → keep_idx → base.prefill_from_ids"
-    )
+    print("\n[2/2] Integration: spec prefill → importance → keep_idx → base.prefill_from_ids")
     keep_cfg = KeepConfig(
         strategy="percentage",
         percentage=float(args.keep_percentage),
         chunk=(not args.no_chunk),
         chunk_size=int(args.chunk_size),
     )
-    res = spec.prefill_and_score(
-        args.prompt, pool_kernel_size=13, keep_cfg=keep_cfg
+    ret = spec.prune_and_base_prefill(
+        base_engine=base,
+        prompt=args.prompt,
+        pool_kernel_size=13,
+        keep_cfg=keep_cfg,
+        prefill_logit_bs=1,
     )
-    keep_idx = res["keep_idx"]
-    orig_seq_len = res["orig_seq_len"]
-    assert keep_idx.size > 0 and keep_idx[-1] == orig_seq_len - 1
-
-    enc = tokenizer(args.prompt, return_tensors="np")
-    final_ids = enc["input_ids"][:, keep_idx]
-    final_pos = keep_idx.reshape(1, -1).astype(np.int64)
-
-    t0 = time.perf_counter()
-    out_full2, pos_ids2, _ = base.run_prefill(
-        [args.prompt], generation_len=int(args.gen_len), prefill_logit_bs=1
-    )
-    ttft_baseline_s = time.perf_counter() - t0
-
-    t1 = time.perf_counter()
-    out_pruned, seq_len_used, pad_len_pruned, num_chunks_pruned = base.prefill_from_ids(
-        final_ids, final_pos, prefill_logit_bs=1
-    )
-    ttft_pruned_s = time.perf_counter() - t1
-
-    print(
-        f"[spec→base] orig_seq_len={orig_seq_len} kept={keep_idx.size} "
-        f"TTFT baseline={ttft_baseline_s*1000:.1f}ms pruned={ttft_pruned_s*1000:.1f}ms "
-        f"(pad_len={pad_len_pruned}, chunks={num_chunks_pruned})"
-    )
-
-    def _next_token_id(outputs: dict) -> int:
-        logits = outputs["logits"]
-        if logits.ndim == 2:
-            logits = np.expand_dims(logits, 1)
-        return int(logits.argmax(2)[0, 0])
-
-    next_full = _next_token_id(out_full2)
-    next_pruned = _next_token_id(out_pruned)
-    print(
-        f"[parity] first decode token match: {next_full == next_pruned} "
-        f"({next_full} vs {next_pruned})"
-    )
+    print("[k=0 integration]", ret)
 
 
 if __name__ == "__main__":
