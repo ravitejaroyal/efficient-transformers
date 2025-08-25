@@ -518,6 +518,28 @@ class SpecPrefillEngine:
         final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
         final_pos = keep_idx.reshape(1, -1).astype(np.int64)
 
+        # ---- debug: print pruned tokens that will be fed to the base (IDs & tokens) ----
+        try:
+            import os
+
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                ids_list = final_ids[0].tolist()
+                tok_list = self.tokenizer.convert_ids_to_tokens(ids_list)
+                k_preview = (
+                    keep_idx[:32].tolist()
+                    if hasattr(keep_idx, "tolist")
+                    else list(keep_idx)[:32]
+                )
+                t_preview = tok_list[:32]
+                print(
+                    f"[spec:pruned] kept={len(ids_list)}/{orig_seq_len} keep_idx[:32]={k_preview}"
+                )
+                print(f"[spec:pruned] tokens[:32]={t_preview}")
+                txt_preview = self.tokenizer.decode(ids_list, skip_special_tokens=True)
+                print(f"[spec:pruned] text_preview={txt_preview[:120]!r}")
+        except Exception:
+            pass
+
         t0 = time.perf_counter()
         base_engine.run_prefill(
             prompt, generation_len=None, prefill_logit_bs=prefill_logit_bs
