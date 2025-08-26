@@ -483,10 +483,19 @@ class SpecPrefillEngine:
                 if not keys_j:
                     continue
                 S_j = int(keys_j[0].shape[2])
-                imp_j = self.compute_importance(q, keys_j, pool_kernel_size=pool_kernel_size)
+                valid_len = end - start                          # how many real tokens in this chunk (tail may be shorter)
+                if valid_len <= 0:
+                    continue
+                if S_j > valid_len:
+                    # trim keys to real tokens only (avoid scoring padded positions)
+                    keys_j = [k[:, :, :valid_len, :].copy() for k in keys_j]
+                    S_j = valid_len
+
+                imp_j = self.compute_importance(q, keys_j, pool_kernel_size=pool_kernel_size)  # [S_j]
                 if imp_j.shape[0] > S_j:
-                    imp_j = imp_j[:S_j]
-                sl = slice(start, start + S_j)
+                    imp_j = imp_j[:S_j]                     # defensive
+
+                sl = slice(start, start + S_j)              # write exactly S_j (=valid_len) values
                 imp_out[sl] = np.maximum(imp_out[sl], imp_j.astype(np.float32, copy=False))
             assert np.isfinite(imp_out).all(), "global importance contains non-finite values"
             assert float(imp_out.sum()) > 0.0, "global importance sums to zero"
