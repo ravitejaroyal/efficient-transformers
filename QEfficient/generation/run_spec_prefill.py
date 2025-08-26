@@ -45,6 +45,10 @@ def main() -> None:
     parser.add_argument(
         "--no-chunk", action="store_true", help="Disable chunked keep; use per-token percentage."
     )
+    parser.add_argument(
+        "--global-score", action="store_true",
+        help="Two-pass spec scoring over all windows; keep percentage over the entire prompt."
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("QEFF_SPEC_DEBUG", "1")
@@ -112,6 +116,7 @@ def main() -> None:
         pool_kernel_size=13,
         keep_cfg=keep_cfg,
         prefill_logit_bs=1,
+        global_score=args.global_score,
     )
     print("[k=0 integration]", ret)
 
