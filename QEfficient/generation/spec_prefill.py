@@ -409,99 +409,117 @@ class SpecPrefillEngine:
         kept = np.unique(np.concatenate([kept, must_keep], axis=0))
         return kept
 
+
     def prefill_and_score(
         self,
         prompt: str,
         *,
         pool_kernel_size: int = 13,
         keep_cfg: Optional[KeepConfig] = None,
+        global_score: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Run spec prefill, compute importance and select keep indices.
-        IMPORTANT: scoring is performed only over the true prompt length (orig_seq_len),
-        excluding any padded/capacity tail present in QPC buffers.
-        """
+        """Run spec prefill, compute importance and select keep indices."""
         if keep_cfg is None:
-            keep_cfg = KeepConfig(
-                strategy="percentage", percentage=0.1, chunk=True, chunk_size=32
-            )
+            keep_cfg = KeepConfig(strategy="percentage", percentage=0.1, chunk=True, chunk_size=32)
 
-        # Run prefill exactly as before; get position_ids from the first pass
-        outputs, position_ids, _ = self.run_prefill(
-            prompt, generation_len=None, prefill_logit_bs=1
-        )
-        # Spec prefill last token (id/text) for comparison
+        outputs, position_ids, _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
         spec_last_tok_id, spec_last_tok_text = self._next_token_from_outputs(outputs, self.tokenizer)
 
-        # Extract tensors for scoring
         tensors = self.collect_for_scoring(outputs)
-        q = tensors["prefill_queries"]  # [L,H,D]
-        keys_raw = tensors["past_keys"]  # list of [1,H_kv,capacity_seq_len,D]
+        q = tensors["prefill_queries"]      # [L,H,D] (final-token query)
+        keys_raw = tensors["past_keys"]     # [1,H_kv,capacity_seq_len,D] (one window: last chunk)
         if len(keys_raw) == 0:
             raise KeyError("No past_key.{i}_RetainedState outputs to score against")
 
-        # True prompt length from first pass; retained window size from outputs
-        orig_seq_len = int(position_ids.max())  # NOT padded_len or ctx capacity
+        orig_seq_len = int(position_ids.max())
         capacity_seq_len = int(keys_raw[0].shape[2])
 
-        # Window start: last capacity_seq_len tokens of the prompt
         offset = max(0, orig_seq_len - capacity_seq_len)
+        keys = keys_raw if capacity_seq_len <= orig_seq_len else [k[:, :, :orig_seq_len, :].copy() for k in keys_raw]
+        S_eff = min(capacity_seq_len, orig_seq_len)
 
-        # If outputs somehow exceed orig length, trim to orig
-        keys = keys_raw
-        if capacity_seq_len > orig_seq_len:
-            keys = [
-                k[:, :, :orig_seq_len, :].copy() for k in keys
-            ]  # keep [1,H_kv,orig_seq_len,D]
-            S_eff = orig_seq_len
+        if not global_score:
+            imp = self.compute_importance(q, keys, pool_kernel_size=pool_kernel_size)  # [S_eff]
+            if imp.shape[0] > S_eff:
+                imp = imp[:S_eff]
+            assert np.isfinite(imp).all(), "importance contains non-finite values"
+            assert float(imp.sum()) > 0.0, "importance sums to zero"
+            keep_idx_local = self.select_tokens(imp, keep_cfg)
+            if keep_idx_local.size > 0:
+                assert keep_idx_local.dtype == np.int64
+                assert keep_idx_local.min() >= 0
+                assert keep_idx_local.max() < S_eff
+            keep_idx = keep_idx_local + offset
+            imp_out = imp
         else:
-            S_eff = capacity_seq_len
+            imp_out = np.zeros((orig_seq_len,), dtype=np.float32)
+            enc = self.tokenizer(prompt, return_tensors="np", padding=True)
+            padded_len = enc["input_ids"].shape[1]
+            num_chunks = -(padded_len // -self._prefill_seq_len)
+            padded_len = num_chunks * self._prefill_seq_len
+            enc = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
+            enc["position_ids"] = np.where(enc.pop("attention_mask"), np.arange(padded_len), -1)
+            enc.pop("token_type_ids", None)
+            logits_out_placeholder = np.zeros((1, 1, self._vocab_size), dtype=np.float32)
+            self._session.set_buffers({"logits": logits_out_placeholder})
+            for j in range(num_chunks):
+                start = j * self._prefill_seq_len
+                end = min(start + self._prefill_seq_len, orig_seq_len)
+                if end <= start:
+                    break
+                chunk_inputs = {
+                    "input_ids":    enc["input_ids"][:, start:start + self._prefill_seq_len],
+                    "position_ids": enc["position_ids"][:, start:start + self._prefill_seq_len],
+                }
+                out_j = self._session.run(chunk_inputs)
+                keys_j = []
+                idx = 0
+                while True:
+                    name = f"past_key.{idx}_RetainedState"
+                    if name not in out_j:
+                        break
+                    keys_j.append(out_j[name])
+                    idx += 1
+                if not keys_j:
+                    continue
+                S_j = int(keys_j[0].shape[2])
+                imp_j = self.compute_importance(q, keys_j, pool_kernel_size=pool_kernel_size)
+                if imp_j.shape[0] > S_j:
+                    imp_j = imp_j[:S_j]
+                sl = slice(start, start + S_j)
+                imp_out[sl] = np.maximum(imp_out[sl], imp_j.astype(np.float32, copy=False))
+            assert np.isfinite(imp_out).all(), "global importance contains non-finite values"
+            assert float(imp_out.sum()) > 0.0, "global importance sums to zero"
+            keep_idx = self.select_tokens(imp_out, keep_cfg)
 
-        # Compute importance over the effective window
-        imp = self.compute_importance(
-            q, keys, pool_kernel_size=pool_kernel_size
-        )  # [S_eff]
-        if imp.shape[0] > S_eff:
-            imp = imp[:S_eff]
-        # Numerical sanity
-        assert np.isfinite(imp).all(), "importance contains non-finite values"
-        assert float(imp.sum()) > 0.0, "importance sums to zero"
+        if keep_idx.size == 0 or keep_idx[-1] != (orig_seq_len - 1):
+            keep_idx = np.unique(np.concatenate([keep_idx, np.array([orig_seq_len - 1], dtype=np.int64)]))
 
-        # Select indices in WINDOW coordinates, then map to GLOBAL [0..orig_seq_len-1]
-        keep_idx_local = self.select_tokens(imp, keep_cfg)  # [k], 0..S_eff-1
-        if keep_idx_local.size > 0:
-            assert (
-                keep_idx_local.dtype == np.int64
-            ), f"keep_idx dtype must be int64, got {keep_idx_local.dtype}"
-            assert keep_idx_local.min() >= 0, f"negative keep index found: {keep_idx_local.min()}"
-            assert (
-                keep_idx_local.max() < S_eff
-            ), f"keep_idx contains out-of-window indices >= {S_eff}: {keep_idx_local.max()}"
-        keep_idx = keep_idx_local + offset
-
-        # Optional debug: set QEFF_SPEC_DEBUG=1 to print one-liner summary
         import os
-
         if os.getenv("QEFF_SPEC_DEBUG", ""):
-            kept_pct = (100.0 * len(keep_idx) / (S_eff if S_eff > 0 else 1.0))
-            print(
-                f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
-                f"imp_len={imp.shape[0]} kept={len(keep_idx)} ({kept_pct:.1f}%)"
-            )
+            if not global_score:
+                kept_pct = (100.0 * len(keep_idx) / (S_eff if S_eff > 0 else 1.0))
+                print(f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
+                      f"kept={len(keep_idx)} ({kept_pct:.1f}%) [window]")
+            else:
+                kept_pct = (100.0 * len(keep_idx) / (orig_seq_len if orig_seq_len > 0 else 1.0))
+                print(f"[spec:score] orig_seq_len={orig_seq_len} windows={num_chunks} "
+                      f"kept={len(keep_idx)} ({kept_pct:.1f}%) [global]")
             print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
 
         return {
-            "importance": imp,  # length S_eff (window)
-            "keep_idx": keep_idx,  # GLOBAL indices (offset applied)
-            "orig_seq_len": orig_seq_len,  # true prompt length (non-pad count)
+            "importance": imp_out,
+            "keep_idx": keep_idx,
+            "orig_seq_len": orig_seq_len,
             "shapes": {
                 "prefill_queries": q.shape,
                 "first_key": (keys_raw[0].shape if len(keys_raw) else None),
-                "window": {"S_eff": S_eff, "offset": offset},
+                "window": {"S_cap": capacity_seq_len},
             },
             "spec_last_tok_id": spec_last_tok_id,
             "spec_last_tok_text": spec_last_tok_text,
         }
+
 
     def prune_and_base_prefill(
         self,
@@ -511,6 +529,7 @@ class SpecPrefillEngine:
         pool_kernel_size: int = 13,
         keep_cfg: Optional[KeepConfig] = None,
         prefill_logit_bs: int = 1,
+        global_score: bool = False,
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
@@ -522,6 +541,7 @@ class SpecPrefillEngine:
             prompt,
             pool_kernel_size=pool_kernel_size,
             keep_cfg=keep_cfg,
+            global_score=global_score,
         )
         t_spec_end = time.perf_counter()
         ttft_spec_only_s = t_spec_end - t_spec_start
