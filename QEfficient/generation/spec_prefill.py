@@ -440,68 +440,64 @@ class SpecPrefillEngine:
         if len(keys_raw) == 0:
             raise KeyError("No past_key.{i}_RetainedState outputs to score against")
 
-        # True prompt length (number of real tokens) from first-pass position_ids
+        # True prompt length from first pass; retained window size from outputs
         orig_seq_len = int(position_ids.max())  # NOT padded_len or ctx capacity
         capacity_seq_len = int(keys_raw[0].shape[2])
 
-        # Trim keys to true prompt length to ignore pad/capacity tail
+        # Window start: last capacity_seq_len tokens of the prompt
+        offset = max(0, orig_seq_len - capacity_seq_len)
+
+        # If outputs somehow exceed orig length, trim to orig
         keys = keys_raw
         if capacity_seq_len > orig_seq_len:
             keys = [
                 k[:, :, :orig_seq_len, :].copy() for k in keys
             ]  # keep [1,H_kv,orig_seq_len,D]
+            S_eff = orig_seq_len
+        else:
+            S_eff = capacity_seq_len
 
-        # Compute importance and defensively ensure len == orig_seq_len
+        # Compute importance over the effective window
         imp = self.compute_importance(
             q, keys, pool_kernel_size=pool_kernel_size
-        )  # [S_trim]
-        if imp.shape[0] > orig_seq_len:
-            imp = imp[:orig_seq_len]
-        # Assert we didn’t leak padded positions into importance
-        assert (
-            imp.shape[0] == orig_seq_len
-        ), f"importance length {imp.shape[0]} != orig_seq_len {orig_seq_len}"
+        )  # [S_eff]
+        if imp.shape[0] > S_eff:
+            imp = imp[:S_eff]
+        # Numerical sanity
         assert np.isfinite(imp).all(), "importance contains non-finite values"
         assert float(imp.sum()) > 0.0, "importance sums to zero"
 
-        # Select keep indices over [0..orig_seq_len-1]
-        keep_idx = self.select_tokens(imp, keep_cfg)
-
-        # Simple anti-pad invariants
-        if keep_idx.size > 0:
+        # Select indices in WINDOW coordinates, then map to GLOBAL [0..orig_seq_len-1]
+        keep_idx_local = self.select_tokens(imp, keep_cfg)  # [k], 0..S_eff-1
+        if keep_idx_local.size > 0:
             assert (
-                keep_idx.dtype == np.int64
-            ), f"keep_idx dtype must be int64, got {keep_idx.dtype}"
-            assert keep_idx.min() >= 0, f"negative keep index found: {keep_idx.min()}"
+                keep_idx_local.dtype == np.int64
+            ), f"keep_idx dtype must be int64, got {keep_idx_local.dtype}"
+            assert keep_idx_local.min() >= 0, f"negative keep index found: {keep_idx_local.min()}"
             assert (
-                keep_idx.max() < orig_seq_len
-            ), f"keep_idx contains padded indices >= orig_seq_len={orig_seq_len}: {keep_idx.max()}"
-            assert (
-                keep_idx[-1] == orig_seq_len - 1
-            ), f"last real token must be kept (expected {orig_seq_len-1}, got {keep_idx[-1]})"
+                keep_idx_local.max() < S_eff
+            ), f"keep_idx contains out-of-window indices >= {S_eff}: {keep_idx_local.max()}"
+        keep_idx = keep_idx_local + offset
 
         # Optional debug: set QEFF_SPEC_DEBUG=1 to print one-liner summary
         import os
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
-            kept_pct = (
-                (100.0 * len(keep_idx) / orig_seq_len) if orig_seq_len > 0 else 0.0
-            )
+            kept_pct = (100.0 * len(keep_idx) / (S_eff if S_eff > 0 else 1.0))
             print(
-                f"[spec:score] orig_seq_len={orig_seq_len} capacity_seq_len={capacity_seq_len} "
+                f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
                 f"imp_len={imp.shape[0]} kept={len(keep_idx)} ({kept_pct:.1f}%)"
             )
             print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
 
         return {
-            "importance": imp,  # length orig_seq_len
-            "keep_idx": keep_idx,  # sorted unique, includes orig_seq_len-1
+            "importance": imp,  # length S_eff (window)
+            "keep_idx": keep_idx,  # GLOBAL indices (offset applied)
             "orig_seq_len": orig_seq_len,  # true prompt length (non-pad count)
             "shapes": {
                 "prefill_queries": q.shape,
-                "first_key": (
-                    keys_raw[0].shape if len(keys_raw) else None
-                ),  # report pre-trim shape for visibility
+                "first_key": (keys_raw[0].shape if len(keys_raw) else None),
+                "window": {"S_eff": S_eff, "offset": offset},
             },
             "spec_last_tok_id": spec_last_tok_id,
             "spec_last_tok_text": spec_last_tok_text,
