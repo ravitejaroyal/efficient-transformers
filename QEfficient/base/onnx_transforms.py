@@ -131,8 +131,12 @@ class AttachProbeOutput(OnnxTransform):
         g.node.extend([shape_const])
 
         # ConstantOfShape → FP32 zeros of [1,S,H]
+        # NOTE: For opset-13, ConstantOfShape.value must be a 1-D tensor (not scalar).
         zero_f32 = helper.make_tensor(
-            name="probe_zero_f32", data_type=TensorProto.FLOAT, dims=[], vals=[0.0]
+            name="probe_zero_f32",
+            data_type=TensorProto.FLOAT,
+            dims=[1],  # 1-D vector, length 1
+            vals=[0.0],
         )
         zeros = helper.make_node(
             "ConstantOfShape",
@@ -141,7 +145,11 @@ class AttachProbeOutput(OnnxTransform):
             name="probe_zeros",
             value=zero_f32,
         )
+        # Register both the node and its attribute tensor; QAIC resolves the attribute via the initializer table.
         g.node.extend([zeros])
+        # avoid duplicate initializer by name if re-running
+        if not any(init.name == "probe_zero_f32" for init in g.initializer):
+            g.initializer.append(zero_f32)
 
         # Register graph output with concrete dims, FP32
         if not any(o.name == "probe_chunk_f32" for o in g.output):
