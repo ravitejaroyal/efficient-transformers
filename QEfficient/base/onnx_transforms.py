@@ -175,20 +175,42 @@ class AttachSpecPrefillScoring(OnnxTransform):
             ]
         )
 
-        # Create zeros tensor [1,1,hidden] and Add for broadcast -> [1,S_cap,hidden]
-        zeros = helper.make_tensor(
-            name="importance_zeros_1x1xH",
-            data_type=TensorProto.FLOAT16,
-            dims=[1, 1, hidden_size],
-            vals=[0] * hidden_size,
+        # Generate zeros [1,1,hidden] via ConstantOfShape (FP32), then cast to FP16
+        shape_1x1xH = helper.make_tensor(
+            "importance_shape_1x1xH", TensorProto.INT64, [3], [1, 1, hidden_size]
         )
-        g.initializer.append(zeros)
+        g.initializer.append(shape_1x1xH)
+        zeros_fp32 = "importance_zeros_fp32"
+        g.node.extend(
+            [
+                helper.make_node(
+                    "ConstantOfShape",
+                    ["importance_shape_1x1xH"],
+                    [zeros_fp32],
+                    name="importance_zeros_cos",
+                )
+            ]
+        )
+        zeros_fp16 = "importance_zeros_fp16"
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Cast",
+                    [zeros_fp32],
+                    [zeros_fp16],
+                    name="importance_zeros_cast",
+                    to=TensorProto.FLOAT16,
+                )
+            ]
+        )
+
+        # Broadcast add: [1,S_cap,1] + [1,1,hidden] -> [1,S_cap,hidden]
         out_1SH = "importance_1SH"
         g.node.extend(
             [
                 helper.make_node(
                     "Add",
-                    [imp_1S1, "importance_zeros_1x1xH"],
+                    [imp_1S1, zeros_fp16],
                     [out_1SH],
                     name="importance_broadcast_add",
                 )
