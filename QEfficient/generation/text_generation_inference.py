@@ -848,7 +848,7 @@ class QEffTextGenerationBase:
                 (self.batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
-        # We don't consume device-scoring output during decode either
+        # Not consuming device scoring output during decode – ensure it stays skipped
         if "importance_chunk" in self._session.output_names:
             self._session.skip_buffers(["importance_chunk"])
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id

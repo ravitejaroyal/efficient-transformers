@@ -97,6 +97,9 @@ class QAICInferenceSession:
         self.buf_dims = qaicrt.BufferDimensionsVecRef(
             [(aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims)) for binding in self.bindings]
         )
+        # Always skip device-scoring output binding (shape is specialization-dependent and not consumed here)
+        if "importance_chunk" in self.output_names:
+            self.skip_buffers(["importance_chunk"])
         # Debug: show compiled dims for importance_chunk once
         try:
             if "importance_chunk" in self.output_names:
