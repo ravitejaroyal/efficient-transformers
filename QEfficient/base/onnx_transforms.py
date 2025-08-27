@@ -116,13 +116,6 @@ class AttachProbeOutput(OnnxTransform):
         # Read compile-time export hints; fallback to safe defaults.
         S = int(kwargs.get("seq_len", 32))
         H = int(kwargs.get("hidden_size", 2048))
-        try:
-            print(
-                f"[transform] {type(AttachProbeOutput).__name__} kwargs: seq_len={S}, hidden_size={H}",
-                flush=True,
-            )
-        except Exception:
-            pass
 
         # Build INT64 shape [1, S, H] as an initializer
         shape_name = "probe_shape_i64"
