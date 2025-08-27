@@ -8,6 +8,7 @@
 import hashlib
 import inspect
 import logging
+import os
 import shutil
 import subprocess
 import warnings
@@ -18,7 +19,7 @@ from typing import Dict, List, Optional
 import onnx
 import torch
 
-from QEfficient.base.onnx_transforms import OnnxTransform
+from QEfficient.base.onnx_transforms import AttachSpecPrefillScoring, OnnxTransform
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
 from QEfficient.generation.cloud_infer import QAICInferenceSession
@@ -192,7 +193,10 @@ class QEFFBaseModel(ABC):
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
-            for transform in self._onnx_transforms:
+            transforms = list(self._onnx_transforms)
+            if os.getenv("QEFF_DEVICE_SCORING") == "1":
+                transforms.append(AttachSpecPrefillScoring())
+            for transform in transforms:
                 model, transformed = transform.apply(model, **transform_kwargs)
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
@@ -348,6 +352,8 @@ class QEFFBaseModel(ABC):
             with open(custom_io_yaml, "w") as fp:
                 for io_name, dtype in custom_io.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
+                if os.getenv("QEFF_DEVICE_SCORING") == "1":
+                    fp.write(" - IOName: importance_chunk\n   Precision: float32\n\n")
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
