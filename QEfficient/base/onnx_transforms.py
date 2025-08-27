@@ -207,12 +207,38 @@ class AttachSpecPrefillScoring(OnnxTransform):
 
         cat = "importance_cat_layers"
         g.node.extend([helper.make_node("Concat", layer_scores, [cat], name=cat, axis=0)])
+        # ReduceMean over layers -> FP32
+        importance_fp32 = "importance_fp32"
+        g.node.extend(
+            [
+                helper.make_node(
+                    "ReduceMean",
+                    [cat],
+                    [importance_fp32],
+                    name="importance_rmean",
+                    axes=[0],
+                    keepdims=0,
+                )
+            ]
+        )  # [S_cap] FP32
+        # Cast to FP16 and publish as final output name
         out_name = "importance_chunk"
-        rmean = "importance_rmean"
-        g.node.extend([helper.make_node("ReduceMean", [cat], [out_name], name=rmean, axes=[0], keepdims=0)])
-
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Cast",
+                    [importance_fp32],
+                    [out_name],
+                    name="importance_cast_fp16",
+                    to=TensorProto.FLOAT16,
+                )
+            ]
+        )
+        # Append graph output (FP16, [S_cap]) if missing
         if not any(o.name == out_name for o in g.output):
-            g.output.extend([helper.make_tensor_value_info(out_name, TensorProto.FLOAT, None)])
+            g.output.extend(
+                [helper.make_tensor_value_info(out_name, TensorProto.FLOAT16, ["seq_len"])]
+            )
         changed = True
         return model, changed
 

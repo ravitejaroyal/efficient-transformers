@@ -198,6 +198,15 @@ class QEFFBaseModel(ABC):
                 transforms.append(AttachSpecPrefillScoring())
             for transform in transforms:
                 model, transformed = transform.apply(model, **transform_kwargs)
+            # Debug: confirm presence of importance_chunk when device scoring is on
+            if os.getenv("QEFF_DEVICE_SCORING") == "1":
+                try:
+                    outs = [o.name for o in model.graph.output]
+                    print(
+                        f"[export] device_scoring=1, importance_chunk in outputs={ 'importance_chunk' in outs }"
+                    )
+                except Exception:
+                    pass
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
             )
@@ -352,8 +361,27 @@ class QEFFBaseModel(ABC):
             with open(custom_io_yaml, "w") as fp:
                 for io_name, dtype in custom_io.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
+                # If device scoring enabled, include importance_chunk only if present, and as float16
+                include_importance = False
                 if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                    fp.write(" - IOName: importance_chunk\n   Precision: float\n\n")
+                    try:
+                        import onnx
+                        m = onnx.load(str(onnx_path), load_external_data=False)
+                        include_importance = any(
+                            o.name == "importance_chunk" for o in m.graph.output
+                        )
+                    except Exception:
+                        include_importance = False
+                if include_importance:
+                    fp.write(
+                        " - IOName: importance_chunk\n   Precision: float16\n\n"
+                    )
+                else:
+                    if os.getenv("QEFF_DEVICE_SCORING") == "1":
+                        print(
+                            "[compile] device scoring enabled but 'importance_chunk' not found in ONNX outputs; "
+                            "skipping custom IO entry (fallback to host scoring)."
+                        )
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
