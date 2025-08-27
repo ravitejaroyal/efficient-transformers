@@ -195,7 +195,7 @@ class QEFFBaseModel(ABC):
 
             transforms = list(self._onnx_transforms)
             if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                transforms.append(AttachSpecPrefillScoring())
+                transforms.append(AttachSpecPrefillScoring)
             for transform in transforms:
                 model, transformed = transform.apply(model, **transform_kwargs)
             # Debug: confirm presence of importance_chunk when device scoring is on
