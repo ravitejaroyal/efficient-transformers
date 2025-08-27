@@ -104,7 +104,13 @@ class SplitTensorsTransform(OnnxTransform):
 
 class AttachSpecPrefillScoring(OnnxTransform):
     @staticmethod
-    def apply(model: "onnx.ModelProto", **kwargs):
+    def apply(
+        model: "onnx.ModelProto",
+        *,
+        seq_len_const: int = 128,
+        hidden_size: int = 2048,
+        **kwargs,
+    ):
         g = model.graph
 
         # If already present, do nothing
@@ -112,9 +118,7 @@ class AttachSpecPrefillScoring(OnnxTransform):
             return model, False
 
         # Expect an upstream FP32 tensor to cast from. If your scoring head already
-        # produces 'importance_fp32', reuse it. Otherwise, STOP and add the compute first.
-        # For plumbing verification, you may temporarily bind to an existing FP32 1D tensor
-        # if present; but production scoring must compute the true importance.
+        # produces "importance_fp32", reuse it. Otherwise, STOP and add the compute first.
         source_name = None
         # Try to find a 1D FP32 tensor in value_infos (best-effort)
         for vi in list(g.value_info) + list(g.output):
@@ -122,25 +126,104 @@ class AttachSpecPrefillScoring(OnnxTransform):
                 source_name = vi.name
                 break
         if source_name is None:
-            print("[transform] AttachSpecPrefillScoring: no FP32 source tensor found; not adding output")
+            print(
+                "[transform] AttachSpecPrefillScoring: no FP32 source tensor found; not adding output"
+            )
             return model, False
 
-        cast16 = "importance_chunk_fp16"
+        # Cast → [S_cap] FP16
+        imp_fp16_1d = "importance_fp16_1d"
         g.node.extend(
             [
                 helper.make_node(
                     "Cast",
                     [source_name],
-                    [cast16],
+                    [imp_fp16_1d],
                     name="importance_cast_fp16",
                     to=TensorProto.FLOAT16,
                 )
             ]
         )
+
+        # Expand to [S_cap, hidden] then add batch → [1, S_cap, hidden]
+        shape_const = helper.make_tensor(
+            name="importance_expand_shape",
+            data_type=TensorProto.INT64,
+            dims=[2],
+            vals=[seq_len_const, hidden_size],
+        )
+        g.initializer.append(shape_const)
+        target_shape = "importance_target_shape"
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    [target_shape],
+                    name="importance_target_shape_const",
+                    value=shape_const,
+                )
+            ]
+        )
+        imp_unsq = "importance_unsq"  # [S_cap,1]
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Unsqueeze",
+                    [imp_fp16_1d],
+                    [imp_unsq],
+                    name="importance_unsqueeze",
+                    axes=[1],
+                )
+            ]
+        )
+        imp_exp = "importance_expanded"  # [S_cap, hidden]
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Expand",
+                    [imp_unsq, target_shape],
+                    [imp_exp],
+                    name="importance_expand",
+                )
+            ]
+        )
+        imp_unsq_batch = "importance_unsq_batch"  # [1, S_cap, hidden]
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Unsqueeze",
+                    [imp_exp],
+                    [imp_unsq_batch],
+                    name="importance_add_batch",
+                    axes=[0],
+                )
+            ]
+        )
+
+        # Final graph output (FP16, [1, seq_len, hidden])
         out_name = "importance_chunk"
-        # Bind cast16 to named output (use Identity to give the exact public name)
-        g.node.extend([helper.make_node("Identity", [cast16], [out_name], name="importance_out_bind")])
-        # Append graph output: FLOAT16, 1D dynamic length
-        g.output.extend([helper.make_tensor_value_info(out_name, TensorProto.FLOAT16, ["seq_len"])])
-        print("[transform] AttachSpecPrefillScoring: appended graph output 'importance_chunk' (FLOAT16)")
+        if not any(o.name == out_name for o in g.output):
+            g.output.extend(
+                [
+                    helper.make_tensor_value_info(
+                        out_name,
+                        TensorProto.FLOAT16,
+                        ["batch", "seq_len", "hidden"],
+                    )
+                ]
+            )
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Identity",
+                    [imp_unsq_batch],
+                    [out_name],
+                    name="importance_out_bind",
+                )
+            ]
+        )
+        print(
+            "[transform] AttachSpecPrefillScoring: appended graph output 'importance_chunk' (FLOAT16 [1,S_cap,hidden])"
+        )
         return model, True

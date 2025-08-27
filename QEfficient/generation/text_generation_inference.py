@@ -705,10 +705,6 @@ class QEffTextGenerationBase:
         # Set the prefill logic buffer
         logits_out_placeholder = np.zeros((prefill_logit_bs, 1, self._vocab_size), dtype=np.float32)
         self._session.set_buffers({"logits": logits_out_placeholder})
-        # Device-scoring output is specialized differently than the flat compiled binding (262144 vs [1,S,2048]).
-        # We don't consume it here; skip to avoid specialization shape validation.
-        if "importance_chunk" in self._session.output_names:
-            self._session.skip_buffers(["importance_chunk"])
 
         inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
@@ -762,9 +758,6 @@ class QEffTextGenerationBase:
             (self.full_batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
         )
         self._session.set_buffers({"logits": logits_out_placeholder})
-        # Skip device-scoring output in CB decode as well
-        if "importance_chunk" in self._session.output_names:
-            self._session.skip_buffers(["importance_chunk"])
         # Generate flag for tracking progress for each batch ID
         current_decode_ongoing = np.full((self.full_batch_size, 1), True)
 
@@ -848,9 +841,6 @@ class QEffTextGenerationBase:
                 (self.batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
-        # Not consuming device scoring output during decode – ensure it stays skipped
-        if "importance_chunk" in self._session.output_names:
-            self._session.skip_buffers(["importance_chunk"])
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
         num_token = 0
         for num_token in range(1, generation_len):
