@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+import os
 
 from QEfficient.generation.base_infer import write_io_files
 from QEfficient.generation.cloud_infer import QAICInferenceSession
@@ -66,14 +67,18 @@ class SpecPrefillEngine:
         self.decode_input_ids = None
         self.decode_pos_ids = None
         self.generation_len = None
+        self.device_scoring = os.getenv("QEFF_DEVICE_SCORING") == "1"
+        self._importance_slices: List[np.ndarray] = []
 
         self.tokenizer = tokenizer
         self._set_tokenizer_params()
 
-        # Speculative prefill needs past_key.* for scoring; skip only past_value.* to reduce host IO.
+        # Speculative prefill needs past_key.* only for host scoring. Skip buffers accordingly.
         past_inputs = [n for n in self._session.input_names if n.startswith("past_")]
-        past_val_outs = [n for n in self._session.output_names if n.startswith("past_value.")]
-        self._session.skip_buffers(past_inputs + past_val_outs)
+        past_outs = [n for n in self._session.output_names if n.startswith("past_value.")]
+        if self.device_scoring:
+            past_outs += [n for n in self._session.output_names if n.startswith("past_key.")]
+        self._session.skip_buffers(past_inputs + past_outs)
 
     def _set_tokenizer_params(self):
         """
@@ -171,6 +176,8 @@ class SpecPrefillEngine:
         self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None
     ):
         """Runs prefill for a given prompt and generation length."""
+        if self.device_scoring:
+            self._importance_slices = []
         inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
         position_ids = inputs["attention_mask"].sum(1, keepdims=True)
         padded_len = inputs["input_ids"].shape[1]
@@ -221,6 +228,13 @@ class SpecPrefillEngine:
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
             outputs = self._session.run(chunk_inputs)
+            if self.device_scoring:
+                assert "importance_chunk" in outputs, (
+                    "QPC missing 'importance_chunk' output while QEFF_DEVICE_SCORING=1"
+                )
+                self._importance_slices.append(
+                    outputs["importance_chunk"].astype(np.float32, copy=False)
+                )
             if self._write_io_dir is not None:
                 write_io_files(
                     inputs,
@@ -424,6 +438,35 @@ class SpecPrefillEngine:
 
         outputs, position_ids, _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
         spec_last_tok_id, spec_last_tok_text = self._next_token_from_outputs(outputs, self.tokenizer)
+        orig_seq_len = int(position_ids.max())
+
+        if self.device_scoring:
+            if not self._importance_slices:
+                raise RuntimeError("No importance_chunk slices collected")
+            imp_out = np.concatenate(self._importance_slices, axis=0)[:orig_seq_len].astype(np.float32, copy=False)
+            keep_idx = self.select_tokens(imp_out, keep_cfg)
+            if keep_idx.size > 0:
+                assert keep_idx.dtype == np.int64
+                assert keep_idx.min() >= 0
+                assert keep_idx.max() < orig_seq_len
+            if keep_idx.size == 0 or keep_idx[-1] != (orig_seq_len - 1):
+                keep_idx = np.unique(
+                    np.concatenate([keep_idx, np.array([orig_seq_len - 1], dtype=np.int64)])
+                )
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                kept_pct = (100.0 * len(keep_idx) / (orig_seq_len if orig_seq_len > 0 else 1.0))
+                print(
+                    f"[spec:score] S_orig={orig_seq_len} imp_len={imp_out.shape[0]} kept={len(keep_idx)} ({kept_pct:.1f}%)"
+                )
+                print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
+            return {
+                "importance": imp_out,
+                "keep_idx": keep_idx,
+                "orig_seq_len": orig_seq_len,
+                "shapes": {"prefill_queries": None, "first_key": None},
+                "spec_last_tok_id": spec_last_tok_id,
+                "spec_last_tok_text": spec_last_tok_text,
+            }
 
         tensors = self.collect_for_scoring(outputs)
         q = tensors["prefill_queries"]      # [L,H,D] (final-token query)
@@ -431,11 +474,14 @@ class SpecPrefillEngine:
         if len(keys_raw) == 0:
             raise KeyError("No past_key.{i}_RetainedState outputs to score against")
 
-        orig_seq_len = int(position_ids.max())
         capacity_seq_len = int(keys_raw[0].shape[2])
 
         offset = max(0, orig_seq_len - capacity_seq_len)
-        keys = keys_raw if capacity_seq_len <= orig_seq_len else [k[:, :, :orig_seq_len, :].copy() for k in keys_raw]
+        keys = (
+            keys_raw
+            if capacity_seq_len <= orig_seq_len
+            else [k[:, :, :orig_seq_len, :].copy() for k in keys_raw]
+        )
         S_eff = min(capacity_seq_len, orig_seq_len)
 
         if not global_score:
@@ -468,8 +514,8 @@ class SpecPrefillEngine:
                 if end <= start:
                     break
                 chunk_inputs = {
-                    "input_ids":    enc["input_ids"][:, start:start + self._prefill_seq_len],
-                    "position_ids": enc["position_ids"][:, start:start + self._prefill_seq_len],
+                    "input_ids": enc["input_ids"][:, start : start + self._prefill_seq_len],
+                    "position_ids": enc["position_ids"][:, start : start + self._prefill_seq_len],
                 }
                 out_j = self._session.run(chunk_inputs)
                 keys_j = []
@@ -483,37 +529,43 @@ class SpecPrefillEngine:
                 if not keys_j:
                     continue
                 S_j = int(keys_j[0].shape[2])
-                valid_len = end - start                          # how many real tokens in this chunk (tail may be shorter)
+                valid_len = end - start
                 if valid_len <= 0:
                     continue
                 if S_j > valid_len:
-                    # trim keys to real tokens only (avoid scoring padded positions)
                     keys_j = [k[:, :, :valid_len, :].copy() for k in keys_j]
                     S_j = valid_len
 
-                imp_j = self.compute_importance(q, keys_j, pool_kernel_size=pool_kernel_size)  # [S_j]
+                imp_j = self.compute_importance(
+                    q, keys_j, pool_kernel_size=pool_kernel_size
+                )  # [S_j]
                 if imp_j.shape[0] > S_j:
-                    imp_j = imp_j[:S_j]                     # defensive
+                    imp_j = imp_j[:S_j]
 
-                sl = slice(start, start + S_j)              # write exactly S_j (=valid_len) values
+                sl = slice(start, start + S_j)
                 imp_out[sl] = np.maximum(imp_out[sl], imp_j.astype(np.float32, copy=False))
             assert np.isfinite(imp_out).all(), "global importance contains non-finite values"
             assert float(imp_out.sum()) > 0.0, "global importance sums to zero"
             keep_idx = self.select_tokens(imp_out, keep_cfg)
 
         if keep_idx.size == 0 or keep_idx[-1] != (orig_seq_len - 1):
-            keep_idx = np.unique(np.concatenate([keep_idx, np.array([orig_seq_len - 1], dtype=np.int64)]))
+            keep_idx = np.unique(
+                np.concatenate([keep_idx, np.array([orig_seq_len - 1], dtype=np.int64)])
+            )
 
-        import os
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             if not global_score:
                 kept_pct = (100.0 * len(keep_idx) / (S_eff if S_eff > 0 else 1.0))
-                print(f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
-                      f"kept={len(keep_idx)} ({kept_pct:.1f}%) [window]")
+                print(
+                    f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
+                    f"kept={len(keep_idx)} ({kept_pct:.1f}%) [window]"
+                )
             else:
                 kept_pct = (100.0 * len(keep_idx) / (orig_seq_len if orig_seq_len > 0 else 1.0))
-                print(f"[spec:score] orig_seq_len={orig_seq_len} windows={num_chunks} "
-                      f"kept={len(keep_idx)} ({kept_pct:.1f}%) [global]")
+                print(
+                    f"[spec:score] orig_seq_len={orig_seq_len} windows={num_chunks} "
+                    f"kept={len(keep_idx)} ({kept_pct:.1f}%) [global]"
+                )
             print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
 
         return {
