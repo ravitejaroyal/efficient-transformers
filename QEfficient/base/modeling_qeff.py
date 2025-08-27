@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import onnx
 import torch
 
-from QEfficient.base.onnx_transforms import AttachSpecPrefillScoring, OnnxTransform
+from QEfficient.base.onnx_transforms import OnnxTransform
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
 from QEfficient.generation.cloud_infer import QAICInferenceSession
@@ -193,25 +193,28 @@ class QEFFBaseModel(ABC):
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
+            # Build transform list: model-registered + optional device scoring
             transforms = list(self._onnx_transforms)
-            if os.getenv("QEFF_DEVICE_SCORING") == "1":
+            device_scoring = bool(os.getenv("QEFF_DEVICE_SCORING", "")) or bool(
+                os.getenv("QEFF_ENABLE_DEVICE_SCORING", "")
+            )
+            if device_scoring:
+                from QEfficient.base.onnx_transforms import AttachSpecPrefillScoring
+
                 transforms.append(AttachSpecPrefillScoring)
-            for transform in transforms:
-                model, transformed = transform.apply(model, **transform_kwargs)
-            # Debug: confirm presence of importance_chunk when device scoring is on
-            if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                try:
-                    outs = [o.name for o in model.graph.output]
-                    print(
-                        f"[export] device_scoring=1, importance_chunk in outputs={ 'importance_chunk' in outs }"
-                    )
-                except Exception:
-                    pass
+
+            # Apply transforms (static apply, do not instantiate)
+            for tclass in transforms:
+                model, transformed = tclass.apply(model, **transform_kwargs)
+
+            # Persist transform metadata and save
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
             )
-            logger.info("ONNX transforms applied")
-
+            has_importance = any(o.name == "importance_chunk" for o in model.graph.output)
+            logger.info(
+                f"[export] device_scoring={int(device_scoring)} importance_chunk in outputs={has_importance}"
+            )
             onnx.save(model, onnx_path)
             logger.info("Transformed onnx saved")
 
@@ -357,31 +360,31 @@ class QEFFBaseModel(ABC):
 
         # Write custom_io.yaml file
         if custom_io is not None:
+            # If device scoring is enabled and ONNX has importance_chunk, add it as float16
+            try:
+                device_scoring = bool(os.getenv("QEFF_DEVICE_SCORING", "")) or bool(
+                    os.getenv("QEFF_ENABLE_DEVICE_SCORING", "")
+                )
+                if device_scoring:
+                    g = onnx.load(str(onnx_path), load_external_data=False).graph
+                    if any(o.name == "importance_chunk" for o in g.output):
+                        custom_io = dict(custom_io)  # shallow copy
+                        custom_io["importance_chunk"] = "float16"
+                        logger.info(
+                            "[compile] adding custom IO for importance_chunk (float16)"
+                        )
+                    else:
+                        logger.info(
+                            "[compile] device scoring enabled but 'importance_chunk' not found in ONNX outputs; "
+                            "skipping custom IO entry (fallback to host scoring)."
+                        )
+            except Exception as _e:
+                logger.warning(f"[compile] custom-IO importance check failed: {_e}")
+
             custom_io_yaml = compile_dir / "custom_io.yaml"
             with open(custom_io_yaml, "w") as fp:
                 for io_name, dtype in custom_io.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
-                # If device scoring enabled, include importance_chunk only if present, and as float16
-                include_importance = False
-                if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                    try:
-                        import onnx
-                        m = onnx.load(str(onnx_path), load_external_data=False)
-                        include_importance = any(
-                            o.name == "importance_chunk" for o in m.graph.output
-                        )
-                    except Exception:
-                        include_importance = False
-                if include_importance:
-                    fp.write(
-                        " - IOName: importance_chunk\n   Precision: float16\n\n"
-                    )
-                else:
-                    if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                        print(
-                            "[compile] device scoring enabled but 'importance_chunk' not found in ONNX outputs; "
-                            "skipping custom IO entry (fallback to host scoring)."
-                        )
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
