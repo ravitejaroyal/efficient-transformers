@@ -146,6 +146,11 @@ class AttachSpecPrefillScoring(OnnxTransform):
         )
 
         # Expand to [S_cap, hidden] then add batch → [1, S_cap, hidden]
+        # --- Opset 13-compliant constants ---
+        axes1 = helper.make_tensor("importance_axes1", TensorProto.INT64, [1], [1])
+        g.initializer.append(axes1)
+        axes0 = helper.make_tensor("importance_axes0", TensorProto.INT64, [1], [0])
+        g.initializer.append(axes0)
         shape_const = helper.make_tensor(
             name="importance_expand_shape",
             data_type=TensorProto.INT64,
@@ -153,50 +158,40 @@ class AttachSpecPrefillScoring(OnnxTransform):
             vals=[seq_len_const, hidden_size],
         )
         g.initializer.append(shape_const)
-        target_shape = "importance_target_shape"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Constant",
-                    [],
-                    [target_shape],
-                    name="importance_target_shape_const",
-                    value=shape_const,
-                )
-            ]
-        )
-        imp_unsq = "importance_unsq"  # [S_cap,1]
+
+        # Unsqueeze to [S_cap,1] then Expand to [S_cap, hidden]
+        imp_unsq = "importance_unsq"
         g.node.extend(
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_fp16_1d],
+                    [imp_fp16_1d, "importance_axes1"],
                     [imp_unsq],
                     name="importance_unsqueeze",
-                    axes=[1],
                 )
             ]
         )
-        imp_exp = "importance_expanded"  # [S_cap, hidden]
+        imp_exp = "importance_expanded"
         g.node.extend(
             [
                 helper.make_node(
                     "Expand",
-                    [imp_unsq, target_shape],
+                    [imp_unsq, "importance_expand_shape"],
                     [imp_exp],
                     name="importance_expand",
                 )
             ]
         )
-        imp_unsq_batch = "importance_unsq_batch"  # [1, S_cap, hidden]
+
+        # Add batch dim → [1, S_cap, hidden]
+        imp_unsq_batch = "importance_unsq_batch"
         g.node.extend(
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_exp],
+                    [imp_exp, "importance_axes0"],
                     [imp_unsq_batch],
                     name="importance_add_batch",
-                    axes=[0],
                 )
             ]
         )
