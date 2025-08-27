@@ -14,7 +14,6 @@ from QEfficient.transformers.models.modeling_outputs_qeff import (
     QEffBaseModelOutputWithPast,
     QEffCausalLMOutputWithPast,
 )
-from QEfficient.base.onnx_transforms import AttachSpecPrefillScoring
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaConfig,
@@ -345,8 +344,6 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
     - add new args cache idx for the kv retention
     """
 
-    # Post-export ONNX transforms to run before saving the final model
-    _onnx_transforms = [AttachSpecPrefillScoring]
 
     def forward(
         self,
