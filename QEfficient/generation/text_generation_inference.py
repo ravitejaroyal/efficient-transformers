@@ -705,6 +705,20 @@ class QEffTextGenerationBase:
         # Set the prefill logic buffer
         logits_out_placeholder = np.zeros((prefill_logit_bs, 1, self._vocab_size), dtype=np.float32)
         self._session.set_buffers({"logits": logits_out_placeholder})
+        # If device-scoring output exists and buf_dims got flattened somewhere, fix it to compiled dims
+        if "importance_chunk" in self._session.output_names:
+            try:
+                idx = self._session.binding_index_map["importance_chunk"]
+                exp = tuple(self._session.bindings[idx].dims)  # e.g., (1, 128, 2048)
+                cur = tuple(self._session.buf_dims[idx][1])
+                if cur != exp:
+                    print(
+                        f"[prefill] correcting importance_chunk buf_dims from {cur} to {exp}", flush=True
+                    )
+                    self._session.set_buffers({"importance_chunk": np.zeros(exp, dtype=np.float16)})
+            except Exception as e:
+                if os.getenv("QEFF_SPEC_DEBUG", ""):
+                    print(f"[prefill] importance_chunk correction skipped: {e}", flush=True)
 
         inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
@@ -758,7 +772,7 @@ class QEffTextGenerationBase:
             (self.full_batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
         )
         self._session.set_buffers({"logits": logits_out_placeholder})
-        # Skip device-scoring output for decode specialization in CB mode as well
+        # Skip device-scoring output in CB decode too
         if "importance_chunk" in self._session.output_names:
             self._session.skip_buffers(["importance_chunk"])
         # Generate flag for tracking progress for each batch ID
@@ -844,7 +858,7 @@ class QEffTextGenerationBase:
                 (self.batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
-        # Skip device-scoring output for decode specialization (we don't consume it here)
+        # We don't consume importance_chunk during decode; avoid specialization shape checks
         if "importance_chunk" in self._session.output_names:
             self._session.skip_buffers(["importance_chunk"])
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id

@@ -97,6 +97,13 @@ class QAICInferenceSession:
         self.buf_dims = qaicrt.BufferDimensionsVecRef(
             [(aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims)) for binding in self.bindings]
         )
+        # Debug: show compiled dims for importance_chunk once
+        try:
+            if "importance_chunk" in self.output_names:
+                idx = self.binding_index_map["importance_chunk"]
+                print(f"[qaic:init] importance_chunk compiled dims={self.bindings[idx].dims}", flush=True)
+        except Exception:
+            pass
 
     @property
     def input_names(self) -> List[str]:
@@ -136,6 +143,9 @@ class QAICInferenceSession:
                 buffer.itemsize,
                 buffer.shape if len(buffer.shape) > 0 else (1,),
             )
+            # Debug: log any overrides to importance_chunk dims
+            if buffer_name == "importance_chunk":
+                print(f"[qaic:set] importance_chunk override shape={buffer.shape}", flush=True)
 
     def skip_buffers(self, skipped_buffer_names: List[str]):
         """
@@ -159,6 +169,13 @@ class QAICInferenceSession:
         """
         # Set inputs
         self.set_buffers(inputs)
+        # Debug: print current buf_dims for importance_chunk prior to submit
+        try:
+            if "importance_chunk" in self.output_names:
+                idx = self.binding_index_map["importance_chunk"]
+                print(f"[qaic:run] importance_chunk buf_dims={self.buf_dims[idx][1]}", flush=True)
+        except Exception:
+            pass
         if self.execObj.setData(self.qbuffers, self.buf_dims) != qaicrt.QStatus.QS_SUCCESS:
             raise MemoryError("Failed to setData")
         # # Run with sync API
