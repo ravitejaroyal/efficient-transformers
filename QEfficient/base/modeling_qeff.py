@@ -199,6 +199,20 @@ class QEFFBaseModel(ABC):
                 "onnx_base_dir": str(tmp_onnx_dir),
                 "model_name": self.model_name,
             }
+            # Provide transform hints so they don't guess shapes
+            try:
+                # seq_len from example inputs (position_ids [B, S])
+                if "position_ids" in example_inputs:
+                    transform_kwargs["seq_length"] = int(
+                        example_inputs["position_ids"].shape[1]
+                    )
+                # model hidden size (e.g., 2048 for Llama-3.2-1B)
+                if hasattr(self, "model") and hasattr(self.model, "config"):
+                    hs = getattr(self.model.config, "hidden_size", None)
+                    if hs:
+                        transform_kwargs["hidden_size"] = int(hs)
+            except Exception:
+                pass
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
