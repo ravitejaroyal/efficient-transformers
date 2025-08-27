@@ -183,6 +183,21 @@ def main(
     #########
     # Compile
     #########
+    # If device-scoring is enabled, ensure we don't reuse a stale ONNX/QPC
+    import os
+    import shutil
+
+    if bool(os.getenv("QEFF_DEVICE_SCORING", "")) or bool(os.getenv("QEFF_ENABLE_DEVICE_SCORING", "")):
+        from QEfficient.utils._utils import (
+            check_and_assign_cache_dir as _check_and_assign_cache_dir,
+        )
+
+        # model's cached dir is under ~/.cache/qeff_models/<model-hash>/
+        model_dir = os.path.join(_check_and_assign_cache_dir(), "qeff_models", qeff_model.model_name)
+        onnx_dir = os.path.join(model_dir, "onnx")
+        if os.path.isdir(onnx_dir):
+            print(f"[infer] device-scoring enabled: removing old ONNX dir {onnx_dir}")
+            shutil.rmtree(onnx_dir, ignore_errors=True)
     _ = qeff_model.compile(
         prefill_seq_len=prompt_len,
         ctx_len=ctx_len,

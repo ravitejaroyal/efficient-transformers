@@ -172,6 +172,15 @@ class QEFFBaseModel(ABC):
                     input_names.append(param)
 
         try:
+            import os
+
+            device_scoring = bool(os.getenv("QEFF_DEVICE_SCORING", "")) or bool(
+                os.getenv("QEFF_ENABLE_DEVICE_SCORING", "")
+            )
+            print(
+                f"[export] enter _export for {self.model_name}  device_scoring={int(device_scoring)}  tmp={tmp_onnx_path}"
+            )
+
             export_kwargs = {} if export_kwargs is None else export_kwargs
             torch.onnx.export(
                 self.model,
@@ -193,30 +202,23 @@ class QEFFBaseModel(ABC):
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
-            # Build transform list: model-registered + optional device scoring
             transforms = list(self._onnx_transforms)
-            device_scoring = bool(os.getenv("QEFF_DEVICE_SCORING", "")) or bool(
-                os.getenv("QEFF_ENABLE_DEVICE_SCORING", "")
-            )
             if device_scoring:
                 from QEfficient.base.onnx_transforms import AttachSpecPrefillScoring
 
                 transforms.append(AttachSpecPrefillScoring)
 
-            # Apply transforms (static apply, do not instantiate)
             for tclass in transforms:
+                print(f"[export] applying transform: {tclass.__name__}")
                 model, transformed = tclass.apply(model, **transform_kwargs)
 
-            # Persist transform metadata and save
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
             )
             has_importance = any(o.name == "importance_chunk" for o in model.graph.output)
-            logger.info(
-                f"[export] device_scoring={int(device_scoring)} importance_chunk in outputs={has_importance}"
-            )
+            print(f"[export] device_scoring={int(device_scoring)}  importance_chunk in outputs={has_importance}")
             onnx.save(model, onnx_path)
-            logger.info("Transformed onnx saved")
+            print(f"[export] saved transformed onnx to {onnx_path}")
 
         except Exception as e:
             logger.error(f"ONNX export (or) ONNXTransforms failed: {e}")
@@ -370,16 +372,14 @@ class QEFFBaseModel(ABC):
                     if any(o.name == "importance_chunk" for o in g.output):
                         custom_io = dict(custom_io)  # shallow copy
                         custom_io["importance_chunk"] = "float16"
-                        logger.info(
-                            "[compile] adding custom IO for importance_chunk (float16)"
-                        )
+                        print("[compile] adding custom IO for importance_chunk (float16)")
                     else:
-                        logger.info(
+                        print(
                             "[compile] device scoring enabled but 'importance_chunk' not found in ONNX outputs; "
                             "skipping custom IO entry (fallback to host scoring)."
                         )
             except Exception as _e:
-                logger.warning(f"[compile] custom-IO importance check failed: {_e}")
+                print(f"[compile] custom-IO importance check failed: {_e}")
 
             custom_io_yaml = compile_dir / "custom_io.yaml"
             with open(custom_io_yaml, "w") as fp:
