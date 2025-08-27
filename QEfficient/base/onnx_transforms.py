@@ -105,7 +105,8 @@ class SplitTensorsTransform(OnnxTransform):
 class AttachSpecPrefillScoring(OnnxTransform):
     """Inject per-chunk token-importance scoring into the speculator graph."""
 
-    def apply(self, model: onnx.ModelProto, **kwargs) -> Tuple[onnx.ModelProto, bool]:
+    @staticmethod
+    def apply(model: onnx.ModelProto, **kwargs) -> Tuple[onnx.ModelProto, bool]:
         g = model.graph
         changed = False
 
