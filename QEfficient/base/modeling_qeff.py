@@ -194,15 +194,6 @@ class QEFFBaseModel(ABC):
             }
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
-            # debug print once
-            try:
-                print(
-                    f"[export] onnx_transform_kwargs: seq_len={transform_kwargs.get('seq_len')} "
-                    f"hidden_size={transform_kwargs.get('hidden_size')}",
-                    flush=True,
-                )
-            except Exception:
-                pass
 
             import os
             from QEfficient.base.onnx_transforms import AttachProbeOutput
