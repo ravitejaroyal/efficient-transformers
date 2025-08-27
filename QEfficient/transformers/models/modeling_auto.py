@@ -1612,11 +1612,25 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 dynamic_axes=dynamic_axes,
             )
 
+        # ---- pass shape hints to ONNX transforms (seq_len, hidden_size) ----
+        try:
+            # Use the actual export example sequence length
+            export_seq_len = int(example_inputs["position_ids"].shape[1])
+        except Exception:
+            export_seq_len = int(getattr(constants, "ONNX_EXPORT_EXAMPLE_SEQ_LEN", 32))
+        export_hidden = int(getattr(self.model.config, "hidden_size", 2048))
+
+        onnx_transform_kwargs = {
+            "seq_len": export_seq_len,
+            "hidden_size": export_hidden,
+        }
+
         return self._export(
-            example_inputs,
-            output_names,
-            dynamic_axes,
+            example_inputs=example_inputs,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
             export_dir=export_dir,
+            onnx_transform_kwargs=onnx_transform_kwargs,
         )
 
     def get_sampling_inputs_and_outputs(
