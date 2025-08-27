@@ -97,16 +97,6 @@ class QAICInferenceSession:
         self.buf_dims = qaicrt.BufferDimensionsVecRef(
             [(aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims)) for binding in self.bindings]
         )
-        # Debug: show compiled dims for device scoring output if present
-        try:
-            if "importance_chunk" in self.output_names:
-                idx = self.binding_index_map["importance_chunk"]
-                print(
-                    f"[qaic:init] importance_chunk compiled dims={self.bindings[idx].dims}",
-                    flush=True,
-                )
-        except Exception:
-            pass
 
     @property
     def input_names(self) -> List[str]:

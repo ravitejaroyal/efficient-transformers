@@ -145,21 +145,24 @@ class AttachSpecPrefillScoring(OnnxTransform):
             ]
         )
 
-        # Use broadcast Add to avoid Expand. Unsqueeze then add zeros to reach [1, S_cap, hidden]
-        # Opset-13 Unsqueeze uses axes as tensor inputs
-        axes0 = helper.make_tensor("importance_axes0", TensorProto.INT64, [1], [0])  # add batch dim first
-        axes2 = helper.make_tensor("importance_axes2", TensorProto.INT64, [1], [2])  # add hidden dim later
-        g.initializer.extend([axes0, axes2])
+        # Opset-13: Unsqueeze uses axes as input tensors
+        axes_add_batch = helper.make_tensor(
+            "importance_axes_add_batch", TensorProto.INT64, [1], [0]
+        )  # [S_cap]→[1,S_cap]
+        axes_add_hidden = helper.make_tensor(
+            "importance_axes_add_hidden", TensorProto.INT64, [1], [2]
+        )  # [1,S_cap]→[1,S_cap,1]
+        g.initializer.extend([axes_add_batch, axes_add_hidden])
 
-        # From [S_cap] -> [1, S_cap] -> [1, S_cap, 1]
+        # From [S_cap] → [1,S_cap] → [1,S_cap,1]
         imp_1S = "importance_1S"
         g.node.extend(
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_fp16_1d, "importance_axes0"],
+                    [imp_fp16_1d, "importance_axes_add_batch"],
                     [imp_1S],
-                    name="importance_unsq_batchless",
+                    name="importance_unsqueeze_batch",
                 )
             ]
         )
@@ -168,16 +171,17 @@ class AttachSpecPrefillScoring(OnnxTransform):
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_1S, "importance_axes2"],
+                    [imp_1S, "importance_axes_add_hidden"],
                     [imp_1S1],
-                    name="importance_unsq_hidden",
+                    name="importance_unsqueeze_hidden",
                 )
             ]
         )
 
-        # Generate zeros [1,1,hidden] via ConstantOfShape (FP32), then cast to FP16
+        # Make zeros [1,1,H] via ConstantOfShape (FP32) → Cast FP16
+        hidden = int(kwargs.get("hidden_size", hidden_size))
         shape_1x1xH = helper.make_tensor(
-            "importance_shape_1x1xH", TensorProto.INT64, [3], [1, 1, hidden_size]
+            "importance_shape_1x1xH", TensorProto.INT64, [3], [1, 1, hidden]
         )
         g.initializer.append(shape_1x1xH)
         zeros_fp32 = "importance_zeros_fp32"
@@ -187,7 +191,7 @@ class AttachSpecPrefillScoring(OnnxTransform):
                     "ConstantOfShape",
                     ["importance_shape_1x1xH"],
                     [zeros_fp32],
-                    name="importance_zeros_cos",
+                    name="importance_zeros_fp32",
                 )
             ]
         )
@@ -204,7 +208,7 @@ class AttachSpecPrefillScoring(OnnxTransform):
             ]
         )
 
-        # Broadcast add: [1,S_cap,1] + [1,1,hidden] -> [1,S_cap,hidden]
+        # Broadcast ADD: [1,S_cap,1] + [1,1,H] → [1,S_cap,H]
         out_1SH = "importance_1SH"
         g.node.extend(
             [
