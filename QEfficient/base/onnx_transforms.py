@@ -102,148 +102,53 @@ class SplitTensorsTransform(OnnxTransform):
         return model, transformed
 
 
-class AttachSpecPrefillScoring(OnnxTransform):
+class AttachProbeOutput(OnnxTransform):
+    """
+    Append a benign FP32 zeros tensor as an extra graph output 'probe_chunk'
+    with concrete dims [1, S_cap, H]. This is gated from _export via env var
+    and does NOT require any runtime buffer handling.
+    """
+
     @staticmethod
-    def apply(
-        model: "onnx.ModelProto",
-        *,
-        seq_len_const: int = 128,
-        hidden_size: int = 2048,
-        **kwargs,
-    ):
+    def apply(model, **kwargs) -> Tuple["onnx.ModelProto", bool]:
         g = model.graph
 
-        # If already present, do nothing
-        if any(o.name == "importance_chunk" for o in g.output):
-            return model, False
+        # Read compile-time export hints; fallback to safe defaults.
+        S = int(kwargs.get("seq_length", 128))
+        H = int(kwargs.get("hidden_size", 2048))
 
-        # Expect an upstream FP32 tensor to cast from. If your scoring head already
-        # produces "importance_fp32", reuse it. Otherwise, STOP and add the compute first.
-        source_name = None
-        # Try to find a 1D FP32 tensor in value_infos (best-effort)
-        for vi in list(g.value_info) + list(g.output):
-            if vi.type.tensor_type.elem_type == TensorProto.FLOAT:
-                source_name = vi.name
-                break
-        if source_name is None:
-            print(
-                "[transform] AttachSpecPrefillScoring: no FP32 source tensor found; not adding output"
-            )
-            return model, False
+        # Build INT64 shape [1, S, H] as an initializer
+        shape_name = "probe_shape_i64"
+        shape_init = helper.make_tensor(
+            name=shape_name, data_type=TensorProto.INT64, dims=[3], vals=[1, S, H]
+        )
+        g.initializer.append(shape_init)
 
-        # Cast → [S_cap] FP16
-        imp_fp16_1d = "importance_fp16_1d"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Cast",
-                    [source_name],
-                    [imp_fp16_1d],
-                    name="importance_cast_fp16",
-                    to=TensorProto.FLOAT16,
-                )
-            ]
+        # Make Constant node that yields the shape tensor
+        shape_const = helper.make_node(
+            "Constant", [], ["probe_shape"], name="probe_shape_const", value=shape_init
         )
+        g.node.extend([shape_const])
 
-        # Opset-13: Unsqueeze uses axes as input tensors
-        axes_add_batch = helper.make_tensor(
-            "importance_axes_add_batch", TensorProto.INT64, [1], [0]
-        )  # [S_cap]→[1,S_cap]
-        axes_add_hidden = helper.make_tensor(
-            "importance_axes_add_hidden", TensorProto.INT64, [1], [2]
-        )  # [1,S_cap]→[1,S_cap,1]
-        g.initializer.extend([axes_add_batch, axes_add_hidden])
+        # ConstantOfShape → FP32 zeros of [1,S,H]
+        zero_f32 = helper.make_tensor(
+            name="probe_zero_f32", data_type=TensorProto.FLOAT, dims=[], vals=[0.0]
+        )
+        zeros = helper.make_node(
+            "ConstantOfShape",
+            ["probe_shape"],
+            ["probe_chunk_f32"],
+            name="probe_zeros",
+            value=zero_f32,
+        )
+        g.node.extend([zeros])
 
-        # From [S_cap] → [1,S_cap] → [1,S_cap,1]
-        imp_1S = "importance_1S"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Unsqueeze",
-                    [imp_fp16_1d, "importance_axes_add_batch"],
-                    [imp_1S],
-                    name="importance_unsqueeze_batch",
-                )
-            ]
-        )
-        imp_1S1 = "importance_1S1"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Unsqueeze",
-                    [imp_1S, "importance_axes_add_hidden"],
-                    [imp_1S1],
-                    name="importance_unsqueeze_hidden",
-                )
-            ]
-        )
-
-        # Make zeros [1,1,H] via ConstantOfShape (FP32) → Cast FP16
-        hidden = int(kwargs.get("hidden_size", hidden_size))
-        shape_1x1xH = helper.make_tensor(
-            "importance_shape_1x1xH", TensorProto.INT64, [3], [1, 1, hidden]
-        )
-        g.initializer.append(shape_1x1xH)
-        zeros_fp32 = "importance_zeros_fp32"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "ConstantOfShape",
-                    ["importance_shape_1x1xH"],
-                    [zeros_fp32],
-                    name="importance_zeros_fp32",
-                )
-            ]
-        )
-        zeros_fp16 = "importance_zeros_fp16"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Cast",
-                    [zeros_fp32],
-                    [zeros_fp16],
-                    name="importance_zeros_cast",
-                    to=TensorProto.FLOAT16,
-                )
-            ]
-        )
-
-        # Broadcast ADD: [1,S_cap,1] + [1,1,H] → [1,S_cap,H]
-        out_1SH = "importance_1SH"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Add",
-                    [imp_1S1, zeros_fp16],
-                    [out_1SH],
-                    name="importance_broadcast_add",
-                )
-            ]
-        )
-
-        # Final graph output (FP16, [1, seq_len, hidden])
-        out_name = "importance_chunk"
-        if not any(o.name == out_name for o in g.output):
+        # Register graph output with concrete dims, FP32
+        if not any(o.name == "probe_chunk_f32" for o in g.output):
             g.output.extend(
-                [
-                    helper.make_tensor_value_info(
-                        out_name,
-                        TensorProto.FLOAT16,
-                        ["batch", "seq_len", "hidden"],
-                    )
-                ]
+                [helper.make_tensor_value_info("probe_chunk_f32", TensorProto.FLOAT, [1, S, H])]
             )
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Identity",
-                    [out_1SH],
-                    [out_name],
-                    name="importance_out_bind",
-                )
-            ]
-        )
-        print(
-            "[transform] AttachSpecPrefillScoring: appended graph output 'importance_chunk' (FLOAT16 [1,S_cap,hidden])"
-        )
+
         return model, True
+
+

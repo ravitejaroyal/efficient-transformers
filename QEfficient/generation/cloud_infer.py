@@ -82,13 +82,20 @@ class QAICInferenceSession:
         ]
         self.bindings = iodesc.selected_set.bindings
         self.binding_index_map = {binding.name: binding.index for binding in self.bindings}
-        idx = self.binding_index_map.get("importance_chunk")
+        # Probe: print allowed shapes for probe_chunk_f32 if present (diagnostic only)
+        idx = self.binding_index_map.get("probe_chunk_f32")
         if idx is not None:
-            print("[qaic:init] imp_chunk compiled dims =", self.bindings[idx].dims)
-            print(
-                "[qaic:init] imp_chunk allowed =",
-                [x[idx][1] for x in self.allowed_shapes],
-            )
+            try:
+                print("[qaic:init] probe_chunk_f32 compiled dims =", self.bindings[idx].dims)
+            except Exception:
+                pass
+            try:
+                print(
+                    "[qaic:init] probe_chunk_f32 allowed      =",
+                    [x[idx][1] for x in self.allowed_shapes],
+                )
+            except Exception:
+                pass
         # Create and load Program
         prog_properties = qaicrt.QAicProgramProperties()
         prog_properties.SubmitRetryTimeoutMs = 60_000

@@ -6,10 +6,7 @@
 # -----------------------------------------------------------------------------
 
 from QEfficient.base.common import QEFFCommonLoader  # noqa: F401
-from QEfficient.base.onnx_transforms import (  # noqa: F401
-    AttachSpecPrefillScoring,
-    OnnxTransform,
-)
+from QEfficient.base.onnx_transforms import OnnxTransform  # noqa: F401
 from QEfficient.transformers.models.modeling_auto import (  # noqa: F401
     QEFFAutoModel,
     QEFFAutoModelForCausalLM,
