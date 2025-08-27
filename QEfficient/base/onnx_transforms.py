@@ -145,53 +145,52 @@ class AttachSpecPrefillScoring(OnnxTransform):
             ]
         )
 
-        # Expand to [S_cap, hidden] then add batch → [1, S_cap, hidden]
-        # --- Opset 13-compliant constants ---
-        axes1 = helper.make_tensor("importance_axes1", TensorProto.INT64, [1], [1])
-        g.initializer.append(axes1)
-        axes0 = helper.make_tensor("importance_axes0", TensorProto.INT64, [1], [0])
-        g.initializer.append(axes0)
-        shape_const = helper.make_tensor(
-            name="importance_expand_shape",
-            data_type=TensorProto.INT64,
-            dims=[2],
-            vals=[seq_len_const, hidden_size],
-        )
-        g.initializer.append(shape_const)
+        # Use broadcast Add to avoid Expand. Unsqueeze then add zeros to reach [1, S_cap, hidden]
+        # Opset-13 Unsqueeze uses axes as tensor inputs
+        axes0 = helper.make_tensor("importance_axes0", TensorProto.INT64, [1], [0])  # add batch dim first
+        axes2 = helper.make_tensor("importance_axes2", TensorProto.INT64, [1], [2])  # add hidden dim later
+        g.initializer.extend([axes0, axes2])
 
-        # Unsqueeze to [S_cap,1] then Expand to [S_cap, hidden]
-        imp_unsq = "importance_unsq"
+        # From [S_cap] -> [1, S_cap] -> [1, S_cap, 1]
+        imp_1S = "importance_1S"
         g.node.extend(
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_fp16_1d, "importance_axes1"],
-                    [imp_unsq],
-                    name="importance_unsqueeze",
+                    [imp_fp16_1d, "importance_axes0"],
+                    [imp_1S],
+                    name="importance_unsq_batchless",
                 )
             ]
         )
-        imp_exp = "importance_expanded"
-        g.node.extend(
-            [
-                helper.make_node(
-                    "Expand",
-                    [imp_unsq, "importance_expand_shape"],
-                    [imp_exp],
-                    name="importance_expand",
-                )
-            ]
-        )
-
-        # Add batch dim → [1, S_cap, hidden]
-        imp_unsq_batch = "importance_unsq_batch"
+        imp_1S1 = "importance_1S1"
         g.node.extend(
             [
                 helper.make_node(
                     "Unsqueeze",
-                    [imp_exp, "importance_axes0"],
-                    [imp_unsq_batch],
-                    name="importance_add_batch",
+                    [imp_1S, "importance_axes2"],
+                    [imp_1S1],
+                    name="importance_unsq_hidden",
+                )
+            ]
+        )
+
+        # Create zeros tensor [1,1,hidden] and Add for broadcast -> [1,S_cap,hidden]
+        zeros = helper.make_tensor(
+            name="importance_zeros_1x1xH",
+            data_type=TensorProto.FLOAT16,
+            dims=[1, 1, hidden_size],
+            vals=[0] * hidden_size,
+        )
+        g.initializer.append(zeros)
+        out_1SH = "importance_1SH"
+        g.node.extend(
+            [
+                helper.make_node(
+                    "Add",
+                    [imp_1S1, "importance_zeros_1x1xH"],
+                    [out_1SH],
+                    name="importance_broadcast_add",
                 )
             ]
         )
@@ -212,7 +211,7 @@ class AttachSpecPrefillScoring(OnnxTransform):
             [
                 helper.make_node(
                     "Identity",
-                    [imp_unsq_batch],
+                    [out_1SH],
                     [out_name],
                     name="importance_out_bind",
                 )
