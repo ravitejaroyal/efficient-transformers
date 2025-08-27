@@ -353,7 +353,7 @@ class QEFFBaseModel(ABC):
                 for io_name, dtype in custom_io.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
                 if os.getenv("QEFF_DEVICE_SCORING") == "1":
-                    fp.write(" - IOName: importance_chunk\n   Precision: float32\n\n")
+                    fp.write(" - IOName: importance_chunk\n   Precision: float\n\n")
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
