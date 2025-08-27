@@ -706,6 +706,19 @@ class QEffTextGenerationBase:
         logits_out_placeholder = np.zeros((prefill_logit_bs, 1, self._vocab_size), dtype=np.float32)
         self._session.set_buffers({"logits": logits_out_placeholder})
 
+        # Bind device-scoring output (prefill specialization) if present
+        if "importance_chunk" in self._session.output_names:
+            try:
+                idx = self._session.binding_index_map["importance_chunk"]
+                # Use the selected-set binding dims for prefill (typically [1, 128, 2048])
+                imp_shape = tuple(self._session.bindings[idx].dims)
+                self._session.set_buffers({"importance_chunk": np.zeros(imp_shape, dtype=np.float16)})
+            except Exception as e:
+                # Non-fatal: just skip binding if anything unexpected
+                # (keeps host-side scoring fallback intact)
+                if os.getenv("QEFF_SPEC_DEBUG", ""):
+                    print(f"[prefill] importance_chunk bind skipped: {e}", flush=True)
+
         inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
         inputs.pop("token_type_ids", None)
@@ -835,6 +848,10 @@ class QEffTextGenerationBase:
         Returns:
             num_token (int): The number of tokens processed in the decoding process.
         """
+        # Skip device-scoring output for decode specialization unless you intend to consume it
+        if "importance_chunk" in self._session.output_names:
+            self._session.skip_buffers(["importance_chunk"])
+
         if self.is_tlm:
             logits_out_placeholder = np.zeros(
                 (self.batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
