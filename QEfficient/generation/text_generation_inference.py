@@ -735,6 +735,12 @@ class QEffTextGenerationBase:
             outputs = self._session.run(chunk_inputs)
             if self._write_io_dir is not None:
                 write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
+        # --- probe: log importance_chunk shape after prefill (last chunk) ---
+        try:
+            if os.getenv("QEFF_SPEC_DEBUG") and "importance_chunk" in outputs:
+                print(f"[probe] prefill importance_chunk shape={tuple(outputs['importance_chunk'].shape)}", flush=True)
+        except Exception:
+            pass
         return (
             outputs,
             position_ids,
@@ -842,11 +848,22 @@ class QEffTextGenerationBase:
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+        # one-time probe flag for importance shape in decode
+        _printed_decode_imp = getattr(self, "_printed_decode_imp", False)
         num_token = 0
         for num_token in range(1, generation_len):
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
             outputs = self._session.run(decode_inputs)
+            # --- probe: log importance_chunk shape on first decode step ---
+            if not _printed_decode_imp:
+                try:
+                    if os.getenv("QEFF_SPEC_DEBUG") and "importance_chunk" in outputs:
+                        print(f"[probe] decode importance_chunk shape={tuple(outputs['importance_chunk'].shape)}", flush=True)
+                        _printed_decode_imp = True
+                        setattr(self, "_printed_decode_imp", True)
+                except Exception:
+                    pass
 
             if self._write_io_dir is not None:
                 write_io_files(decode_inputs, outputs, self._write_io_dir, "decode", "aic_batch_io", True, False)
