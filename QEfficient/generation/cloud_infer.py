@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 from warnings import warn
 
+import os
 import numpy as np
 
 try:
@@ -297,30 +298,36 @@ class QAICInferenceSession:
             )
             # Robust reshape for dynamic output compiled as flat core-tensor
             if output_name == "importance_chunk":
-                compiled = self._compiled_dims_by_name.get(output_name, [])
-                # If compiled dims are flat, infer (1,S,H) from allowed shapes
-                if isinstance(compiled, list) and len(compiled) == 1:
+                # Prefer specialization in self.buf_dims (e.g., [1,1,2048] for decode)
+                target_dims = tuple(self.buf_dims[buffer_index][1])
+                if isinstance(target_dims, (list, tuple)) and len(target_dims) >= 3:
+                    arr = arr.reshape(target_dims)
+                else:
+                    # Fallback: infer (1,S,H) from flat size using allowed shapes
                     try:
                         idx = buffer_index
-                        cands = [
+                        cand_H = [
                             dims[-1]
                             for dims in (
                                 shape_set[idx][1] for shape_set in self.allowed_shapes
                             )
                             if isinstance(dims, (list, tuple)) and len(dims) >= 3
                         ]
-                        H = cands[0] if cands else None
+                        H = int(cand_H[0]) if cand_H else None
                         if H:
                             flat = int(arr.size)
-                            S = flat // int(H)
-                            arr = arr.reshape((1, S, int(H)))
+                            S = flat // H
+                            arr = arr.reshape((1, S, H))
                         else:
-                            arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+                            arr = arr.reshape(target_dims if target_dims else (arr.size,))
                     except Exception:
-                        arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
-                else:
-                    arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+                        arr = arr.reshape(target_dims if target_dims else (arr.size,))
             else:
                 arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
             outputs[output_name] = arr
+        if os.getenv("QEFF_DEBUG_SHAPES") and "importance_chunk" in outputs:
+            print(
+                "[probe] final importance_chunk shape =",
+                outputs["importance_chunk"].shape,
+            )
         return outputs
