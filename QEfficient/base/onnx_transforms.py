@@ -104,59 +104,120 @@ class SplitTensorsTransform(OnnxTransform):
 
 class AttachProbeOutput(OnnxTransform):
     """
-    Append a benign FP32 zeros tensor as an extra graph output 'probe_chunk'
-    with concrete dims [1, S_cap, H]. This is gated from _export via env var
-    and does NOT require any runtime buffer handling.
+    Append a benign FP16 zeros tensor 'importance_chunk' with dynamic shape
+    [1, S, H], where S is derived from `position_ids` (S=chunk_len for prefill,
+    S=1 for decode). This avoids any reliance on export-example seq_len and
+    matches compiler specializations automatically.
     """
 
     @staticmethod
     def apply(model, **kwargs) -> Tuple["onnx.ModelProto", bool]:
+        from onnx import helper, TensorProto
+
         g = model.graph
 
-        # Read compile-time export hints; fallback to safe defaults.
-        S = int(kwargs.get("seq_len", 32))
+        # ---- Hidden size (from config if provided; fallback to 2048) ----
         H = int(kwargs.get("hidden_size", 2048))
 
-        # Build INT64 shape [1, S, H] as an initializer
-        shape_name = "probe_shape_i64"
-        shape_init = helper.make_tensor(
-            name=shape_name, data_type=TensorProto.INT64, dims=[3], vals=[1, S, H]
-        )
-        g.initializer.append(shape_init)
-
-        # Make Constant node that yields the shape tensor
-        shape_const = helper.make_node(
-            "Constant", [], ["probe_shape"], name="probe_shape_const", value=shape_init
-        )
-        g.node.extend([shape_const])
-
-        # ConstantOfShape → FP32 zeros of [1,S,H]
-        # NOTE: For opset-13, ConstantOfShape.value must be a 1-D tensor (not scalar).
-        zero_f32 = helper.make_tensor(
-            name="probe_zero_f32",
-            data_type=TensorProto.FLOAT,
-            dims=[1],  # 1-D vector, length 1
-            vals=[0.0],
-        )
-        zeros = helper.make_node(
-            "ConstantOfShape",
-            ["probe_shape"],
-            ["probe_chunk_f32"],
-            name="probe_zeros",
-            value=zero_f32,
-        )
-        # Register both the node and its attribute tensor; QAIC resolves the attribute via the initializer table.
-        g.node.extend([zeros])
-        # avoid duplicate initializer by name if re-running
-        if not any(init.name == "probe_zero_f32" for init in g.initializer):
-            g.initializer.append(zero_f32)
-
-        # Register graph output with concrete dims, FP32
-        if not any(o.name == "probe_chunk_f32" for o in g.output):
-            g.output.extend(
-                [helper.make_tensor_value_info("probe_chunk_f32", TensorProto.FLOAT, [1, S, H])]
+        # ---- Derive seq_len S from position_ids shape ----
+        # 1) locate position_ids input (shape [B,S])
+        pos_name = None
+        for inp in g.input:
+            if inp.name == "position_ids":
+                pos_name = inp.name
+                break
+        # 2) Shape(position_ids) -> [B, S]
+        if pos_name is not None:
+            g.node.extend([
+                helper.make_node("Shape", [pos_name], ["importance_pos_shape"],
+                                 name="importance_pos_shape")
+            ])
+            # 3) Gather index=1 (seq dim) along axis=0  -> scalar S
+            idx_one = helper.make_tensor(
+                name="importance_idx_one", data_type=TensorProto.INT64, dims=[1], vals=[1]
             )
+            if not any(init.name == "importance_idx_one" for init in g.initializer):
+                g.initializer.append(idx_one)
+            g.node.extend([
+                helper.make_node("Gather",
+                                 ["importance_pos_shape", "importance_idx_one"],
+                                 ["importance_seq_len_scalar"],
+                                 name="importance_gather_seq", axis=0)
+            ])
+            # 4) Unsqueeze scalar -> [S] (axes as tensor input per opset-13)
+            axes0 = helper.make_tensor(
+                name="importance_axes0", data_type=TensorProto.INT64, dims=[1], vals=[0]
+            )
+            if not any(init.name == "importance_axes0" for init in g.initializer):
+                g.initializer.append(axes0)
+            g.node.extend([
+                helper.make_node("Unsqueeze",
+                                 ["importance_seq_len_scalar", "importance_axes0"],
+                                 ["importance_seq_len_1d"],
+                                 name="importance_unsqueeze_seq")
+            ])
+            seq_input = "importance_seq_len_1d"
+        else:
+            # Should not happen; fallback to S=32
+            seq_const = helper.make_tensor(
+                name="importance_seq_fallback", data_type=TensorProto.INT64, dims=[1], vals=[32]
+            )
+            if not any(init.name == "importance_seq_fallback" for init in g.initializer):
+                g.initializer.append(seq_const)
+            seq_input = "importance_seq_fallback"
+            try:
+                print("[transform] WARNING: `position_ids` not found; falling back to S=32", flush=True)
+            except Exception:
+                pass
 
+        # ---- Build target shape [1, S, H] as a 1-D INT64 vector ----
+        one_vec = helper.make_tensor(
+            name="importance_one_vec", data_type=TensorProto.INT64, dims=[1], vals=[1]
+        )
+        hid_vec = helper.make_tensor(
+            name="importance_hidden_vec", data_type=TensorProto.INT64, dims=[1], vals=[H]
+        )
+        for t in (one_vec, hid_vec):
+            if not any(init.name == t.name for init in g.initializer):
+                g.initializer.append(t)
+        g.node.extend([
+            helper.make_node("Concat",
+                             ["importance_one_vec", seq_input, "importance_hidden_vec"],
+                             ["importance_shape_1sH"],
+                             name="importance_shape_concat",
+                             axis=0)
+        ])
+
+        # ---- ConstantOfShape -> FP32 zeros [1,S,H] (value must be 1-D float) ----
+        zero_f32 = helper.make_tensor(
+            name="importance_zero_f32", data_type=TensorProto.FLOAT, dims=[1], vals=[0.0]
+        )
+        if not any(init.name == "importance_zero_f32" for init in g.initializer):
+            g.initializer.append(zero_f32)
+        g.node.extend([
+            helper.make_node("ConstantOfShape",
+                             ["importance_shape_1sH"],
+                             ["importance_zeros_f32"],
+                             name="importance_zeros",
+                             value=zero_f32)
+        ])
+
+        # ---- Cast to FP16, bind to graph output 'importance_chunk' ----
+        g.node.extend([
+            helper.make_node("Cast", ["importance_zeros_f32"], ["importance_zeros_fp16"],
+                             name="importance_cast_fp16", to=TensorProto.FLOAT16)
+        ])
+        out_name = "importance_chunk"
+        if not any(o.name == out_name for o in g.output):
+            # Rank-3 ValueInfo (symbolic dims); compiler specializes seq_len at compile/run time
+            g.output.extend([
+                helper.make_tensor_value_info(out_name, TensorProto.FLOAT16,
+                                              ["batch", "seq_len", "hidden"])
+            ])
+        g.node.extend([
+            helper.make_node("Identity", ["importance_zeros_fp16"], [out_name],
+                             name="importance_out_bind")
+        ])
         return model, True
 
 
