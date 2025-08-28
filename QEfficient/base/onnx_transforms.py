@@ -132,17 +132,24 @@ class AttachProbeOutput(OnnxTransform):
                 helper.make_node("Shape", [pos_name], ["importance_pos_shape"],
                                  name="importance_pos_shape")
             ])
-            # 3) Gather index=1 (seq dim) along axis=0  -> scalar S
-            idx_one = helper.make_tensor(
-                name="importance_idx_one", data_type=TensorProto.INT64, dims=[1], vals=[1]
-            )
-            if not any(init.name == "importance_idx_one" for init in g.initializer):
-                g.initializer.append(idx_one)
+            # 3) Gather index=1 (seq dim) along axis=0 -> scalar S
+            # Provide index as a scalar Constant so Gather returns a scalar
             g.node.extend([
-                helper.make_node("Gather",
-                                 ["importance_pos_shape", "importance_idx_one"],
-                                 ["importance_seq_len_scalar"],
-                                 name="importance_gather_seq", axis=0)
+                helper.make_node(
+                    "Constant", [], ["importance_idx_one"],
+                    name="importance_idx_one_const",
+                    value=helper.make_tensor(
+                        name="importance_idx_one_val", data_type=TensorProto.INT64, dims=[], vals=[1]
+                    ),
+                )
+            ])
+            g.node.extend([
+                helper.make_node(
+                    "Gather",
+                    ["importance_pos_shape", "importance_idx_one"],
+                    ["importance_seq_len_scalar"],
+                    name="importance_gather_seq", axis=0,
+                )
             ])
             # 4) Unsqueeze scalar -> [S] (axes as tensor input per opset-13)
             axes0 = helper.make_tensor(
