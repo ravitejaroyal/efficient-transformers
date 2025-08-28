@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 from warnings import warn
 
-import os
 import numpy as np
 
 try:
@@ -298,36 +297,41 @@ class QAICInferenceSession:
             )
             # Robust reshape for dynamic output compiled as flat core-tensor
             if output_name == "importance_chunk":
-                # Prefer specialization in self.buf_dims (e.g., [1,1,2048] for decode)
+                # target dims chosen earlier for validator (buf_dims); may be 3D or 5D
                 target_dims = tuple(self.buf_dims[buffer_index][1])
-                if isinstance(target_dims, (list, tuple)) and len(target_dims) >= 3:
-                    arr = arr.reshape(target_dims)
-                else:
-                    # Fallback: infer (1,S,H) from flat size using allowed shapes
+                need_elems = int(np.prod(target_dims))
+                if arr.size != need_elems:
+                    # Pick an allowed dims entry whose product matches buffer size
                     try:
                         idx = buffer_index
-                        cand_H = [
-                            dims[-1]
-                            for dims in (
-                                shape_set[idx][1] for shape_set in self.allowed_shapes
-                            )
-                            if isinstance(dims, (list, tuple)) and len(dims) >= 3
-                        ]
-                        H = int(cand_H[0]) if cand_H else None
-                        if H:
-                            flat = int(arr.size)
-                            S = flat // H
-                            arr = arr.reshape((1, S, H))
-                        else:
-                            arr = arr.reshape(target_dims if target_dims else (arr.size,))
+                        cand = None
+                        for shape_set in self.allowed_shapes:
+                            dims = shape_set[idx][1]
+                            if isinstance(dims, (list, tuple)) and int(np.prod(dims)) == arr.size:
+                                cand = tuple(dims)
+                                break
+                        if cand is not None:
+                            target_dims = cand
                     except Exception:
-                        arr = arr.reshape(target_dims if target_dims else (arr.size,))
+                        pass
+                arr = arr.reshape(target_dims)
+                # Optional: expose the "logical" S (e.g., decode step S=1) by slicing
+                try:
+                    s_logical = None
+                    if "position_ids" in inputs and getattr(inputs["position_ids"], "ndim", 0) >= 2:
+                        s_logical = int(inputs["position_ids"].shape[1])
+                    elif "input_ids" in inputs and getattr(inputs["input_ids"], "ndim", 0) >= 2:
+                        s_logical = int(inputs["input_ids"].shape[1])
+                    # slice only if device returned a larger S than we logically want
+                    if s_logical is not None and target_dims[-2] > s_logical:
+                        # handle both 3D [1,S,H] and 5D [...,S,H]
+                        if len(target_dims) == 3:
+                            arr = arr[:, :s_logical, :]
+                        elif len(target_dims) == 5:
+                            arr = arr[:, :, :, :s_logical, :]
+                except Exception:
+                    pass
+                outputs[output_name] = arr
             else:
-                arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
-            outputs[output_name] = arr
-        if os.getenv("QEFF_DEBUG_SHAPES") and "importance_chunk" in outputs:
-            print(
-                "[probe] final importance_chunk shape =",
-                outputs["importance_chunk"].shape,
-            )
+                outputs[output_name] = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
         return outputs
