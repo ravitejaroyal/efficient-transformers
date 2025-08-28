@@ -87,23 +87,20 @@ class QAICInferenceSession:
             for allowed_shape in iodesc.allowed_shapes
         ]
         self.bindings = iodesc.selected_set.bindings
-        self.binding_index_map = {
-            binding.name: binding.index for binding in self.bindings
-        }
-        # Probe: print allowed shapes for importance_chunk if present (diagnostic only)
-        idx = self.binding_index_map.get("importance_chunk")
-        if idx is not None:
+        self.binding_index_map = {binding.name: binding.index for binding in self.bindings}
+        # Cache compiled (selected-set) dims by name for later reshape logic
+        self._compiled_dims_by_name = {b.name: list(b.dims) for b in self.bindings}
+        # Optional: log compiled vs allowed for importance_chunk (diagnostic)
+        imp_idx = self.binding_index_map.get("importance_chunk")
+        if imp_idx is not None:
             try:
                 print(
                     "[qaic:init] importance_chunk compiled dims =",
-                    self.bindings[idx].dims,
+                    self._compiled_dims_by_name["importance_chunk"],
                 )
-            except Exception:
-                pass
-            try:
                 print(
                     "[qaic:init] importance_chunk allowed      =",
-                    [x[idx][1] for x in self.allowed_shapes],
+                    [x[imp_idx][1] for x in self.allowed_shapes],
                 )
             except Exception:
                 pass
@@ -294,8 +291,36 @@ class QAICInferenceSession:
             buffer_index = self.binding_index_map[output_name]
             if self.qbuffers[buffer_index].size == 0:
                 continue
-            outputs[output_name] = np.frombuffer(
+            arr = np.frombuffer(
                 bytes(output_qbuffers[buffer_index]),
                 aic_to_np_dtype_mapping[self.bindings[buffer_index].type],
-            ).reshape(self.buf_dims[buffer_index][1])
+            )
+            # Robust reshape for dynamic output compiled as flat core-tensor
+            if output_name == "importance_chunk":
+                compiled = self._compiled_dims_by_name.get(output_name, [])
+                # If compiled dims are flat, infer (1,S,H) from allowed shapes
+                if isinstance(compiled, list) and len(compiled) == 1:
+                    try:
+                        idx = buffer_index
+                        cands = [
+                            dims[-1]
+                            for dims in (
+                                shape_set[idx][1] for shape_set in self.allowed_shapes
+                            )
+                            if isinstance(dims, (list, tuple)) and len(dims) >= 3
+                        ]
+                        H = cands[0] if cands else None
+                        if H:
+                            flat = int(arr.size)
+                            S = flat // int(H)
+                            arr = arr.reshape((1, S, int(H)))
+                        else:
+                            arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+                    except Exception:
+                        arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+                else:
+                    arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            else:
+                arr = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            outputs[output_name] = arr
         return outputs
