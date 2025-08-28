@@ -67,7 +67,10 @@ class QAICInferenceSession:
             self.context = qaicrt.Context()
             self.queue = qaicrt.Queue(self.context, 0)  # Async API
         if enable_debug_logs:
-            if self.context.setLogLevel(qaicrt.QLogLevel.QL_DEBUG) != qaicrt.QStatus.QS_SUCCESS:
+            if (
+                self.context.setLogLevel(qaicrt.QLogLevel.QL_DEBUG)
+                != qaicrt.QStatus.QS_SUCCESS
+            ):
                 raise RuntimeError("Failed to setLogLevel")
         qpc = qaicrt.Qpc(str(qpc_path))
         # Load IO Descriptor
@@ -77,16 +80,24 @@ class QAICInferenceSession:
             raise RuntimeError("Failed to getIoDescriptor")
         iodesc.ParseFromString(bytes(iodesc_data))
         self.allowed_shapes = [
-            [(aic_to_np_dtype_mapping[x.type].itemsize, list(x.dims)) for x in allowed_shape.shapes]
+            [
+                (aic_to_np_dtype_mapping[x.type].itemsize, list(x.dims))
+                for x in allowed_shape.shapes
+            ]
             for allowed_shape in iodesc.allowed_shapes
         ]
         self.bindings = iodesc.selected_set.bindings
-        self.binding_index_map = {binding.name: binding.index for binding in self.bindings}
+        self.binding_index_map = {
+            binding.name: binding.index for binding in self.bindings
+        }
         # Probe: print allowed shapes for importance_chunk if present (diagnostic only)
         idx = self.binding_index_map.get("importance_chunk")
         if idx is not None:
             try:
-                print("[qaic:init] importance_chunk compiled dims =", self.bindings[idx].dims)
+                print(
+                    "[qaic:init] importance_chunk compiled dims =",
+                    self.bindings[idx].dims,
+                )
             except Exception:
                 pass
             try:
@@ -107,18 +118,31 @@ class QAICInferenceSession:
         if activate:
             self.activate()
         # Create input qbuffers and buf_dims
-        self.qbuffers = [qaicrt.QBuffer(bytes(binding.size)) for binding in self.bindings]
+        self.qbuffers = [
+            qaicrt.QBuffer(bytes(binding.size)) for binding in self.bindings
+        ]
         self.buf_dims = qaicrt.BufferDimensionsVecRef(
-            [(aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims)) for binding in self.bindings]
+            [
+                (aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims))
+                for binding in self.bindings
+            ]
         )
 
     @property
     def input_names(self) -> List[str]:
-        return [binding.name for binding in self.bindings if binding.dir == aicapi.BUFFER_IO_TYPE_INPUT]
+        return [
+            binding.name
+            for binding in self.bindings
+            if binding.dir == aicapi.BUFFER_IO_TYPE_INPUT
+        ]
 
     @property
     def output_names(self) -> List[str]:
-        return [binding.name for binding in self.bindings if binding.dir == aicapi.BUFFER_IO_TYPE_OUTPUT]
+        return [
+            binding.name
+            for binding in self.bindings
+            if binding.dir == aicapi.BUFFER_IO_TYPE_OUTPUT
+        ]
 
     def activate(self):
         """Activate qpc"""
@@ -173,7 +197,62 @@ class QAICInferenceSession:
         """
         # Set inputs
         self.set_buffers(inputs)
-        if self.execObj.setData(self.qbuffers, self.buf_dims) != qaicrt.QStatus.QS_SUCCESS:
+        # ------------------------------------------------------------------
+        # Dynamic dims fix: outputs like 'importance_chunk' have sequence-
+        # dependent shapes (prefill S=prompt_len, decode S=1). The selected
+        # set may carry a flattened core-tensor for this binding; update only
+        # the dims tuple in self.buf_dims to a specialization that matches
+        # the current S (derived from inputs).
+        # ------------------------------------------------------------------
+        try:
+            # 1) Determine S from inputs (prefer position_ids over input_ids)
+            S = None
+            if (
+                "position_ids" in inputs
+                and getattr(inputs["position_ids"], "ndim", 0) >= 2
+            ):
+                S = int(inputs["position_ids"].shape[1])
+            elif "input_ids" in inputs and getattr(inputs["input_ids"], "ndim", 0) >= 2:
+                S = int(inputs["input_ids"].shape[1])
+            if S is None:
+                S = 1  # conservative fallback (decode step)
+
+            # 2) Specialize dims for outputs with sequence-dependent shapes
+            def _set_dyn_dims(binding_name: str) -> None:
+                if binding_name not in self.binding_index_map:
+                    return
+                idx = self.binding_index_map[binding_name]
+                # allowed_shapes is a list of shape-sets; pick dims for this idx
+                if not self.allowed_shapes:
+                    return
+                allowed_for_idx = []
+                for shape_set in self.allowed_shapes:
+                    # shape_set[idx] is a tuple: (elem_size, dims_tuple)
+                    try:
+                        allowed_for_idx.append(shape_set[idx][1])
+                    except Exception:
+                        pass
+                # Prefer dims whose last two slots match (S, hidden), but also
+                # accept rank-3 [1,S,H]. This covers MDP/TS 5D and non-MDP 3D.
+                target = None
+                for d in allowed_for_idx:
+                    if isinstance(d, (list, tuple)) and len(d) >= 3:
+                        if d[-2] == S:  # match seq length
+                            target = tuple(d)
+                            break
+                if target is not None:
+                    # Keep element size; only swap dims tuple
+                    self.buf_dims[idx] = (self.buf_dims[idx][0], target)
+
+            # Apply to our dynamic output(s)
+            _set_dyn_dims("importance_chunk")
+        except Exception:
+            # Fail-closed: leave buf_dims as-is if anything goes wrong here
+            pass
+        if (
+            self.execObj.setData(self.qbuffers, self.buf_dims)
+            != qaicrt.QStatus.QS_SUCCESS
+        ):
             raise MemoryError("Failed to setData")
         # # Run with sync API
         # if self.execObj.run(self.qbuffers) != qaicrt.QStatus.QS_SUCCESS:
@@ -185,7 +264,9 @@ class QAICInferenceSession:
             # Print additional error messages for unmatched dimension error
             if self.allowed_shapes:
                 error_message += "\n\n"
-                error_message += '(Only if "No matching dimension found" error is present above)'
+                error_message += (
+                    '(Only if "No matching dimension found" error is present above)'
+                )
                 error_message += "\nAllowed shapes:"
                 for i, allowed_shape in enumerate(self.allowed_shapes):
                     error_message += f"\n{i}\n"
