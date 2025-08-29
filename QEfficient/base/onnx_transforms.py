@@ -256,7 +256,10 @@ class AttachEnergyImportance(OnnxTransform):
             return model, False
 
         g.node.extend([helper.make_node("Shape", [pos_name], ["imp_pos_shape"], name="imp_pos_shape")])
-        idx1 = helper.make_tensor("imp_idx1", TensorProto.INT64, [1], [1])
+        # Use a SCALAR index so Gather returns a rank-0 tensor (scalar).
+        # Then Unsqueeze (already below) will make it a 1-D vector [1],
+        # which matches the other shape parts for Concat([1], [S], [H]).
+        idx1 = helper.make_tensor("imp_idx1", TensorProto.INT64, [], [1])
         if not any(i.name == "imp_idx1" for i in g.initializer):
             g.initializer.append(idx1)
         g.node.extend([
