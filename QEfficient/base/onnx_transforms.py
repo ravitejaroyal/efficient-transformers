@@ -228,3 +228,120 @@ class AttachProbeOutput(OnnxTransform):
         return model, True
 
 
+class AttachEnergyImportance(OnnxTransform):
+    """
+    Device placeholder: per-token 'energy' importance with pad masking.
+    Reduces keys across heads and dim, masks pads using position_ids == -1,
+    broadcasts to [1, S, H] and exposes FP16 output 'importance_chunk'.
+    """
+
+    @staticmethod
+    def apply(model, **kwargs):  # type: ignore[override]
+        g = model.graph
+
+        # ---- Hidden size (config or default 2048) ----
+        H = int(kwargs.get("hidden_size", 2048))
+
+        # ---- Find position_ids and derive S ----
+        pos_name = None
+        for inp in g.input:
+            if inp.name == "position_ids":
+                pos_name = inp.name
+                break
+        if pos_name is None:
+            try:
+                print("[transform] WARNING: position_ids not found; skipping AttachEnergyImportance", flush=True)
+            except Exception:
+                pass
+            return model, False
+
+        g.node.extend([helper.make_node("Shape", [pos_name], ["imp_pos_shape"], name="imp_pos_shape")])
+        idx1 = helper.make_tensor("imp_idx1", TensorProto.INT64, [1], [1])
+        if not any(i.name == "imp_idx1" for i in g.initializer):
+            g.initializer.append(idx1)
+        g.node.extend([
+            helper.make_node("Gather", ["imp_pos_shape", "imp_idx1"], ["imp_seq_scalar"], name="imp_gather_seq", axis=0)
+        ])
+        axes0 = helper.make_tensor("imp_axes0", TensorProto.INT64, [1], [0])
+        if not any(i.name == "imp_axes0" for i in g.initializer):
+            g.initializer.append(axes0)
+        g.node.extend([
+            helper.make_node("Unsqueeze", ["imp_seq_scalar", "imp_axes0"], ["imp_seq_1d"], name="imp_unsq_seq")
+        ])
+
+        # ---- Build target shape [1,S,H] ----
+        one_vec = helper.make_tensor("imp_one_vec", TensorProto.INT64, [1], [1])
+        hid_vec = helper.make_tensor("imp_hidden_vec", TensorProto.INT64, [1], [H])
+        for t in (one_vec, hid_vec):
+            if not any(i.name == t.name for i in g.initializer):
+                g.initializer.append(t)
+        g.node.extend([
+            helper.make_node("Concat", ["imp_one_vec", "imp_seq_1d", "imp_hidden_vec"], ["imp_shape_1sH"], name="imp_shape_concat", axis=0)
+        ])
+
+        # ---- Ones tensor for broadcast along hidden ----
+        one_f32 = helper.make_tensor("imp_one_f32", TensorProto.FLOAT, [1], [1.0])
+        if not any(i.name == "imp_one_f32" for i in g.initializer):
+            g.initializer.append(one_f32)
+        g.node.extend([
+            helper.make_node("ConstantOfShape", ["imp_shape_1sH"], ["imp_ones_1sH_f32"], name="imp_ones", value=one_f32)
+        ])
+
+        # ---- Locate a keys tensor ----
+        key_name = None
+        for o in g.output:
+            if o.name.startswith("past_key.") and o.name.endswith("_RetainedState"):
+                key_name = o.name
+                break
+        if key_name is None:
+            try:
+                print("[transform] WARNING: no past_key.*_RetainedState found; skipping AttachEnergyImportance", flush=True)
+            except Exception:
+                pass
+            return model, False
+
+        g.node.extend([
+            helper.make_node("ReduceSum", [key_name], ["imp_energy_1S_f32"], name="imp_reduce_sum", axes=[1, 3], keepdims=0)
+        ])
+
+        # ---- Pad mask from position_ids ----
+        neg1 = helper.make_tensor("imp_neg1", TensorProto.INT64, [1], [-1])
+        if not any(i.name == "imp_neg1" for i in g.initializer):
+            g.initializer.append(neg1)
+        g.node.extend([
+            helper.make_node("Greater", [pos_name, "imp_neg1"], ["imp_mask_bool_1S"], name="imp_mask_gt")
+        ])
+        g.node.extend([
+            helper.make_node("ReduceMax", ["imp_mask_bool_1S"], ["imp_mask_bool_S"], name="imp_mask_dropB", axes=[0], keepdims=0)
+        ])
+        g.node.extend([
+            helper.make_node("Cast", ["imp_mask_bool_S"], ["imp_mask_1S_f32"], name="imp_mask_cast", to=TensorProto.FLOAT)
+        ])
+
+        g.node.extend([
+            helper.make_node("Mul", ["imp_energy_1S_f32", "imp_mask_1S_f32"], ["imp_energy_masked_1S_f32"], name="imp_energy_mask")
+        ])
+
+        axes2 = helper.make_tensor("imp_axes2", TensorProto.INT64, [1], [2])
+        if not any(i.name == "imp_axes2" for i in g.initializer):
+            g.initializer.append(axes2)
+        g.node.extend([
+            helper.make_node("Unsqueeze", ["imp_energy_masked_1S_f32", "imp_axes2"], ["imp_energy_1S1_f32"], name="imp_unsq_energy")
+        ])
+        g.node.extend([
+            helper.make_node("Mul", ["imp_energy_1S1_f32", "imp_ones_1sH_f32"], ["imp_energy_1sH_f32"], name="imp_broadcast_hidden")
+        ])
+
+        g.node.extend([
+            helper.make_node("Cast", ["imp_energy_1sH_f32"], ["imp_energy_1sH_fp16"], name="imp_cast_fp16", to=TensorProto.FLOAT16)
+        ])
+
+        out_name = "importance_chunk"
+        if not any(o.name == out_name for o in g.output):
+            g.output.extend([helper.make_tensor_value_info(out_name, TensorProto.FLOAT16, None)])
+        g.node.extend([
+            helper.make_node("Identity", ["imp_energy_1sH_fp16"], [out_name], name="imp_bind_output")
+        ])
+        return model, True
+
+
