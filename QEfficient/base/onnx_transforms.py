@@ -300,40 +300,46 @@ class AttachEnergyImportance(OnnxTransform):
                 pass
             return model, False
 
+        # -------- 1) Build 0/1 pad mask from position_ids: mask_1S1 --------
+        zero_i64 = helper.make_tensor("imp_zero_i64", TensorProto.INT64, [1], [0])
+        if not any(i.name == "imp_zero_i64" for i in g.initializer):
+            g.initializer.append(zero_i64)
         g.node.extend([
-            helper.make_node("ReduceSum", [key_name], ["imp_energy_1S_f32"], name="imp_reduce_sum", axes=[1, 3], keepdims=0)
+            helper.make_node("GreaterOrEqual", [pos_name, "imp_zero_i64"], ["imp_pos_ge_zero"], name="imp_pos_ge_zero")
         ])
-
-        # ---- Pad mask from position_ids ----
-        neg1 = helper.make_tensor("imp_neg1", TensorProto.INT64, [1], [-1])
-        if not any(i.name == "imp_neg1" for i in g.initializer):
-            g.initializer.append(neg1)
-        g.node.extend([
-            helper.make_node("Greater", [pos_name, "imp_neg1"], ["imp_mask_bool_1S"], name="imp_mask_gt")
-        ])
-        g.node.extend([
-            helper.make_node("ReduceMax", ["imp_mask_bool_1S"], ["imp_mask_bool_S"], name="imp_mask_dropB", axes=[0], keepdims=0)
-        ])
-        g.node.extend([
-            helper.make_node("Cast", ["imp_mask_bool_S"], ["imp_mask_1S_f32"], name="imp_mask_cast", to=TensorProto.FLOAT)
-        ])
-
-        g.node.extend([
-            helper.make_node("Mul", ["imp_energy_1S_f32", "imp_mask_1S_f32"], ["imp_energy_masked_1S_f32"], name="imp_energy_mask")
-        ])
-
         axes2 = helper.make_tensor("imp_axes2", TensorProto.INT64, [1], [2])
         if not any(i.name == "imp_axes2" for i in g.initializer):
             g.initializer.append(axes2)
         g.node.extend([
-            helper.make_node("Unsqueeze", ["imp_energy_masked_1S_f32", "imp_axes2"], ["imp_energy_1S1_f32"], name="imp_unsq_energy")
+            helper.make_node("Unsqueeze", ["imp_pos_ge_zero", "imp_axes2"], ["imp_mask_1S1_bool"], name="imp_mask_unsq")
         ])
         g.node.extend([
-            helper.make_node("Mul", ["imp_energy_1S1_f32", "imp_ones_1sH_f32"], ["imp_energy_1sH_f32"], name="imp_broadcast_hidden")
+            helper.make_node("Cast", ["imp_mask_1S1_bool"], ["imp_mask_1S1"], name="imp_mask_cast", to=TensorProto.FLOAT)
         ])
 
+        # -------- 2) Toy energy from keys: energy_1S1 --------
+        axes_1_3 = helper.make_tensor("imp_axes_1_3", TensorProto.INT64, [2], [1, 3])
+        if not any(i.name == "imp_axes_1_3" for i in g.initializer):
+            g.initializer.append(axes_1_3)
         g.node.extend([
-            helper.make_node("Cast", ["imp_energy_1sH_f32"], ["imp_energy_1sH_fp16"], name="imp_cast_fp16", to=TensorProto.FLOAT16)
+            helper.make_node("ReduceSum", [key_name, "imp_axes_1_3"], ["imp_energy_1S"], name="imp_energy_rsum", keepdims=0)
+        ])
+        g.node.extend([
+            helper.make_node("Cast", ["imp_energy_1S"], ["imp_energy_1S_f32"], name="imp_energy_cast", to=TensorProto.FLOAT)
+        ])
+        g.node.extend([
+            helper.make_node("Unsqueeze", ["imp_energy_1S_f32", "imp_axes2"], ["imp_energy_1S1"], name="imp_energy_unsq")
+        ])
+
+        # -------- 3) Apply mask & broadcast to [1,S,H] --------
+        g.node.extend([
+            helper.make_node("Mul", ["imp_energy_1S1", "imp_mask_1S1"], ["imp_masked_1S1"], name="imp_mul_mask_energy")
+        ])
+        g.node.extend([
+            helper.make_node("Mul", ["imp_masked_1S1", "imp_ones_1sH_f32"], ["imp_energy_1sH_f32"], name="imp_broadcast_mul")
+        ])
+        g.node.extend([
+            helper.make_node("Cast", ["imp_energy_1sH_f32"], ["imp_energy_1sH_fp16"], name="imp_out_cast_fp16", to=TensorProto.FLOAT16)
         ])
 
         out_name = "importance_chunk"
