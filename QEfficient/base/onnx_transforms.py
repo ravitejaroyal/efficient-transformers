@@ -317,17 +317,38 @@ class AttachEnergyImportance(OnnxTransform):
             helper.make_node("Cast", ["imp_mask_1S1_bool"], ["imp_mask_1S1"], name="imp_mask_cast", to=TensorProto.FLOAT)
         ])
 
-        # -------- 2) Toy energy from keys: energy_1S1 --------
+        # -------- 2) Gather chunk keys & compute energy: energy_1S1 --------
+        # Clamp negative positions to 0 for valid gather indices
+        g.node.extend([
+            helper.make_node("Max", [pos_name, "imp_zero_i64"], ["imp_pos_nonneg"], name="imp_pos_clamp")
+        ])
+        # Squeeze batch dimension -> indices [S]
+        g.node.extend([
+            helper.make_node("Squeeze", ["imp_pos_nonneg", "imp_axes0"], ["imp_indices_S"], name="imp_idx_squeeze")
+        ])
+        # Gather only keys for current chunk
+        g.node.extend([
+            helper.make_node("Gather", [key_name, "imp_indices_S"], ["imp_keys_chunk"],
+                             name="imp_gather_keys", axis=2)
+        ])
+        # Reduce over heads & dim, keep dims for robustness
         axes_1_3 = helper.make_tensor("imp_axes_1_3", TensorProto.INT64, [2], [1, 3])
         if not any(i.name == "imp_axes_1_3" for i in g.initializer):
             g.initializer.append(axes_1_3)
         g.node.extend([
-            helper.make_node("ReduceSum", [key_name, "imp_axes_1_3"], ["imp_energy_1S"], name="imp_energy_rsum", keepdims=0)
+            helper.make_node("ReduceSum", ["imp_keys_chunk", "imp_axes_1_3"],
+                             ["imp_energy_keep"], name="imp_rsum_keep", keepdims=1)
         ])
+        axes_1_3_again = helper.make_tensor("imp_axes_1_3_again", TensorProto.INT64, [2], [1, 3])
+        if not any(i.name == "imp_axes_1_3_again" for i in g.initializer):
+            g.initializer.append(axes_1_3_again)
         g.node.extend([
-            helper.make_node("Cast", ["imp_energy_1S"], ["imp_energy_1S_f32"], name="imp_energy_cast", to=TensorProto.FLOAT)
+            helper.make_node("Squeeze", ["imp_energy_keep", "imp_axes_1_3_again"], ["imp_energy_1S"],
+                             name="imp_squeeze_to_1S")
         ])
+        # Cast to FLOAT then Unsqueeze along hidden axis -> [1,S,1]
         g.node.extend([
+            helper.make_node("Cast", ["imp_energy_1S"], ["imp_energy_1S_f32"], name="imp_energy_cast", to=TensorProto.FLOAT),
             helper.make_node("Unsqueeze", ["imp_energy_1S_f32", "imp_axes2"], ["imp_energy_1S1"], name="imp_energy_unsq")
         ])
 
