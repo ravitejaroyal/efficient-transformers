@@ -202,6 +202,16 @@ class QEFFBaseModel(ABC):
             if os.getenv("QEFF_ONNX_PROBE") == "1":
                 transforms.append(AttachProbeOutput)
                 print("[export] ONNX probe enabled: AttachProbeOutput appended", flush=True)
+
+            if os.getenv("QEFF_ONNX_ENERGY") == "1":
+                try:
+                    from QEfficient.base.onnx_transforms import AttachEnergyImportance
+
+                    transforms.append(AttachEnergyImportance)
+                    print("[export] ONNX energy importance enabled", flush=True)
+                except Exception:
+                    pass
+
             for tclass in transforms:
                 print(f"[export] applying transform: {tclass.__name__}")
                 model, transformed = tclass.apply(model, **transform_kwargs)
