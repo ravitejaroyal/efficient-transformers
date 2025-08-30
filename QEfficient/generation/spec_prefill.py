@@ -688,7 +688,9 @@ class SpecPrefillEngine:
             Q_final = Q_final[:, 0, :, :]  # squeeze batch if needed
 
         # 3) Assemble global keys per layer & global pos ids
-        K_global, pos_global, S_total, H_kv, D = self._assemble_global_keys(chunks_keys, chunks_pos)
+        K_global, pos_global, S_total, H_kv, D = self._assemble_global_keys(
+            chunks_keys, chunks_pos
+        )
 
         # 4) Score global importance respecting GQA; aggregate heads/layers; optional smoothing
         importance, diag = self._score_global_importance(
@@ -708,9 +710,10 @@ class SpecPrefillEngine:
         keep_idx = keep_idx.astype(np.int64, copy=False)
 
         return {
-            "importance": importance,         # [S_total]
-            "keep_idx": keep_idx,             # sorted, includes S_total-1
+            "importance": importance,  # [S_total]
+            "keep_idx": keep_idx,  # sorted, includes S_total-1
             "S": S_total,
+            "pos_global": pos_global,  # <-- original absolute positions
             "shapes": {
                 "prefill_queries": tuple(Q_final.shape),
                 "first_key": tuple(K_global[0].shape),
@@ -727,6 +730,7 @@ class SpecPrefillEngine:
         keep_cfg: Optional[KeepConfig] = None,
         prefill_logit_bs: int = 1,
         layers_sel: str = "all",
+        gen_len: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
@@ -744,6 +748,7 @@ class SpecPrefillEngine:
         ttft_spec_only_s = t_spec_end - t_spec_start
         keep_idx = res["keep_idx"]
         S = res["S"]
+        pos_global = res.get("pos_global", None)
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             imp = res["importance"]
             assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
@@ -751,9 +756,13 @@ class SpecPrefillEngine:
                 assert keep_idx.min() >= 0, "negative keep index"
                 assert keep_idx.max() < S, f"keep_idx contains out-of-range indices: {keep_idx.max()} >= {S}"
                 assert keep_idx[-1] == S-1, f"must keep last token: got keep_idx[-1]={keep_idx[-1]} vs S-1={S-1}"
+        # Build pruned input_ids and **original** position_ids
         enc = self.tokenizer(prompt, return_tensors="np")
         final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
-        final_pos = keep_idx.reshape(1, -1).astype(np.int64)
+        if pos_global is None:
+            final_pos = keep_idx.reshape(1, -1).astype(np.int64)
+        else:
+            final_pos = pos_global[keep_idx].reshape(1, -1).astype(np.int64)
 
         # ---- debug: print pruned tokens that will be fed to the base (IDs & tokens) ----
         try:
@@ -793,13 +802,35 @@ class SpecPrefillEngine:
         ttft_base_pruned_only_s = t2 - t1
         ttft_speculative_s = ttft_spec_only_s + ttft_base_pruned_only_s
 
+        # ---- OPTIONAL: run decode on the pruned path to capture the speculative base output ----
+        generated_text_pruned = None
+        try:
+            if gen_len is not None and int(gen_len) > 0:
+                base_engine.initialize_decode_inputs(1, 1, int(gen_len))
+                next_pos = np.array([[S]], dtype=np.int64)
+                base_engine.update_decode_input(
+                    out_base_pruned, next_pos, generation_len=int(gen_len)
+                )
+                decode_inputs = base_engine.prepare_decode_inputs()
+                _ = base_engine.run_decode(decode_inputs, generation_len=int(gen_len))
+                generated = self.tokenizer.batch_decode(
+                    base_engine.generated_ids, skip_special_tokens=True
+                )
+                if isinstance(generated, list) and len(generated) > 0:
+                    generated_text_pruned = generated[0]
+        except Exception:
+            pass
+
         # Always print a compact TTFT summary (ms)
+        t_rect = 0
         print(
             f"[4.3] S={S} kept={keep_idx.size} "
-            f"TTFT(base_full)={ttft_baseline_s*1000:.1f}ms  "
-            f"TTFT(spec_only)={ttft_spec_only_s*1000:.1f}ms  "
-            f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms  "
-            f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
+            f"TTFT(base_full)={ttft_baseline_s*1000:.1f}ms "
+            f"TTFT(spec_only)={t_rect*0+ttft_spec_only_s*1000:.1f}ms ".replace(
+                "t_rect*0+", ""
+            )
+            + f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms "
+            + f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
         )
 
         return {
@@ -812,6 +843,7 @@ class SpecPrefillEngine:
             "ttft_speculative_s": ttft_speculative_s,
             "padded_len_pruned": padded_len,
             "num_chunks_pruned": num_chunks,
+            "generated_text_pruned": generated_text_pruned,
         }
 
 

@@ -119,6 +119,7 @@ def main() -> None:
         keep_cfg=keep_cfg,
         prefill_logit_bs=1,
         layers_sel=args.layers_for_scoring,
+        gen_len=int(args.gen_len) if args.gen_len is not None else None,
     )
     print("[k=0 integration]", ret)
 
