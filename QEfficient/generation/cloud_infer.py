@@ -90,20 +90,6 @@ class QAICInferenceSession:
         self.binding_index_map = {binding.name: binding.index for binding in self.bindings}
         # Cache compiled (selected-set) dims by name for later reshape logic
         self._compiled_dims_by_name = {b.name: list(b.dims) for b in self.bindings}
-        # Optional: log compiled vs allowed for importance_chunk (diagnostic)
-        imp_idx = self.binding_index_map.get("importance_chunk")
-        if imp_idx is not None:
-            try:
-                print(
-                    "[qaic:init] importance_chunk compiled dims =",
-                    self._compiled_dims_by_name["importance_chunk"],
-                )
-                print(
-                    "[qaic:init] importance_chunk allowed      =",
-                    [x[imp_idx][1] for x in self.allowed_shapes],
-                )
-            except Exception:
-                pass
         # Create and load Program
         prog_properties = qaicrt.QAicProgramProperties()
         prog_properties.SubmitRetryTimeoutMs = 60_000
@@ -194,58 +180,6 @@ class QAICInferenceSession:
         """
         # Set inputs
         self.set_buffers(inputs)
-        # ------------------------------------------------------------------
-        # Dynamic dims fix: outputs like 'importance_chunk' have sequence-
-        # dependent shapes (prefill S=prompt_len, decode S=1). The selected
-        # set may carry a flattened core-tensor for this binding; update only
-        # the dims tuple in self.buf_dims to a specialization that matches
-        # the current S (derived from inputs).
-        # ------------------------------------------------------------------
-        try:
-            # 1) Determine S from inputs (prefer position_ids over input_ids)
-            S = None
-            if (
-                "position_ids" in inputs
-                and getattr(inputs["position_ids"], "ndim", 0) >= 2
-            ):
-                S = int(inputs["position_ids"].shape[1])
-            elif "input_ids" in inputs and getattr(inputs["input_ids"], "ndim", 0) >= 2:
-                S = int(inputs["input_ids"].shape[1])
-            if S is None:
-                S = 1  # conservative fallback (decode step)
-
-            # 2) Specialize dims for outputs with sequence-dependent shapes
-            def _set_dyn_dims(binding_name: str) -> None:
-                if binding_name not in self.binding_index_map:
-                    return
-                idx = self.binding_index_map[binding_name]
-                # allowed_shapes is a list of shape-sets; pick dims for this idx
-                if not self.allowed_shapes:
-                    return
-                allowed_for_idx = []
-                for shape_set in self.allowed_shapes:
-                    # shape_set[idx] is a tuple: (elem_size, dims_tuple)
-                    try:
-                        allowed_for_idx.append(shape_set[idx][1])
-                    except Exception:
-                        pass
-                # Prefer dims whose last two slots match (S, hidden), but also
-                # accept rank-3 [1,S,H]. This covers MDP/TS 5D and non-MDP 3D.
-                target = None
-                for d in allowed_for_idx:
-                    if isinstance(d, (list, tuple)) and len(d) >= 3:
-                        if d[-2] == S:  # match seq length
-                            target = tuple(d)
-                            break
-                if target is not None:
-                    # Keep element size; only swap dims tuple
-                    self.buf_dims[idx] = (self.buf_dims[idx][0], target)
-
-            # Apply to our dynamic output(s)
-            _set_dyn_dims("importance_chunk")
-        except Exception:
-            # Fail-closed: leave buf_dims as-is if anything goes wrong here
-            pass
         if (
             self.execObj.setData(self.qbuffers, self.buf_dims)
             != qaicrt.QStatus.QS_SUCCESS
@@ -296,42 +230,5 @@ class QAICInferenceSession:
                 aic_to_np_dtype_mapping[self.bindings[buffer_index].type],
             )
             # Robust reshape for dynamic output compiled as flat core-tensor
-            if output_name == "importance_chunk":
-                # target dims chosen earlier for validator (buf_dims); may be 3D or 5D
-                target_dims = tuple(self.buf_dims[buffer_index][1])
-                need_elems = int(np.prod(target_dims))
-                if arr.size != need_elems:
-                    # Pick an allowed dims entry whose product matches buffer size
-                    try:
-                        idx = buffer_index
-                        cand = None
-                        for shape_set in self.allowed_shapes:
-                            dims = shape_set[idx][1]
-                            if isinstance(dims, (list, tuple)) and int(np.prod(dims)) == arr.size:
-                                cand = tuple(dims)
-                                break
-                        if cand is not None:
-                            target_dims = cand
-                    except Exception:
-                        pass
-                arr = arr.reshape(target_dims)
-                # Optional: expose the "logical" S (e.g., decode step S=1) by slicing
-                try:
-                    s_logical = None
-                    if "position_ids" in inputs and getattr(inputs["position_ids"], "ndim", 0) >= 2:
-                        s_logical = int(inputs["position_ids"].shape[1])
-                    elif "input_ids" in inputs and getattr(inputs["input_ids"], "ndim", 0) >= 2:
-                        s_logical = int(inputs["input_ids"].shape[1])
-                    # slice only if device returned a larger S than we logically want
-                    if s_logical is not None and target_dims[-2] > s_logical:
-                        # handle both 3D [1,S,H] and 5D [...,S,H]
-                        if len(target_dims) == 3:
-                            arr = arr[:, :s_logical, :]
-                        elif len(target_dims) == 5:
-                            arr = arr[:, :, :, :s_logical, :]
-                except Exception:
-                    pass
-                outputs[output_name] = arr
-            else:
-                outputs[output_name] = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            outputs[output_name] = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
         return outputs
