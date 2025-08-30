@@ -275,6 +275,215 @@ class SpecPrefillEngine:
         ex = np.exp(x, dtype=np.float32)
         return ex / np.sum(ex, axis=axis, keepdims=True)
 
+    # ---------- NEW: stable softmax along 1-D vector ----------
+    def _softmax_1d_safe(self, x: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        x: [S] float32 logits
+        mask: optional bool [S]; if provided, masked positions get 0 prob
+        returns: [S] float32
+        """
+        z = x.copy()
+        if mask is not None:
+            # set masked to very large negative
+            z[~mask] = -1e30
+        m = np.max(z, axis=0, keepdims=False)
+        ex = np.exp(z - m, dtype=np.float32)
+        if mask is not None:
+            ex[~mask] = 0.0
+        s = np.sum(ex, axis=0, dtype=np.float32)
+        # avoid div-zero
+        s = np.maximum(s, 1e-30)
+        return ex / s
+
+    # ---------- NEW: build global K per layer & global position ids ----------
+    def _assemble_global_keys(
+        self,
+        chunks_keys: List[List[np.ndarray]],   # len(chunks) list of per-layer key arrays [1,H_kv,S_chunk,D] FP16
+        chunks_pos:  List[np.ndarray],         # len(chunks) list of position_ids [1,S_chunk] int64
+    ) -> Tuple[List[np.ndarray], np.ndarray, int, int, int]:
+        """
+        Concatenate per-chunk keys per layer along token axis (exclude pads) and build global pos_ids.
+
+        Returns:
+          K_global: list length L, each [H_kv, S_total, D] float16 or float32
+          pos_global: [S_total] int64 (>=0)
+          S_total, H_kv, D
+        """
+        # infer shapes from first non-empty chunk/layer
+        L = len(chunks_keys[0])
+        # collect per-layer lists of [H_kv, valid_len_i, D]
+        per_layer_buffers: List[List[np.ndarray]] = [[] for _ in range(L)]
+        pos_global_list: List[np.ndarray] = []
+
+        H_kv = None
+        D = None
+        S_total = 0
+
+        for ci, (keys_per_layer, pos_ids) in enumerate(zip(chunks_keys, chunks_pos)):
+            # pos_ids is [1, S_chunk]
+            p = pos_ids.reshape(-1).astype(np.int64)
+            mask_valid = (p >= 0)
+            valid_len = int(mask_valid.sum())
+            if valid_len == 0:
+                continue
+            pos_global_list.append(p[mask_valid])
+            S_total += valid_len
+
+            for li in range(L):
+                # chunk key tensor shape [1, H_kv, S_chunk, D]
+                k = keys_per_layer[li]
+                if k is None:
+                    raise RuntimeError(f"Missing keys for layer {li} in chunk {ci}")
+                if H_kv is None or D is None:
+                    H_kv = int(k.shape[1])
+                    D = int(k.shape[3])
+                # slice to valid_len, drop batch dim
+                k_slice = k[0, :, :valid_len, :].astype(np.float16, copy=False)
+                per_layer_buffers[li].append(k_slice)  # [H_kv, valid_len, D]
+
+        if H_kv is None or D is None:
+            raise RuntimeError("Unable to infer H_kv/D from keys; no valid chunks?")
+
+        # concatenate per-layer lists along token axis
+        K_global: List[np.ndarray] = []
+        for li in range(L):
+            if len(per_layer_buffers[li]) == 0:
+                raise RuntimeError(f"No key buffers for layer {li}")
+            # [H_kv, S_total, D]
+            K_concat = np.concatenate(per_layer_buffers[li], axis=1).astype(np.float16, copy=False)
+            K_global.append(K_concat)
+
+        pos_global = np.concatenate(pos_global_list, axis=0).astype(np.int64, copy=False)  # [S_total]
+        return K_global, pos_global, S_total, H_kv, D
+
+    # ---------- NEW: global scoring respecting GQA and padding ----------
+    def _score_global_importance(
+        self,
+        Q_final: np.ndarray,           # [L, H, D] (float16/32)
+        K_global: List[np.ndarray],    # len L; each [H_kv, S, D] (float16)
+        pos_global: np.ndarray,        # [S] int64; pad positions excluded already
+        *,
+        layers_sel: Optional[str] = "all",   # "all", "last4", "last1"
+        agg_heads: str = "max",              # "max" or "lse"
+        smooth_window: Optional[int] = None  # e.g., 3 or 5; None to skip
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        """
+        Compute importance[i] over full sequence S:
+          1) per layer/head: softmax( q . K^T / sqrt(D) ) over S (pad already removed)
+          2) aggregate heads (max or log-sum-exp)
+          3) mean across selected layers
+          4) optional smoothing
+
+        Returns:
+          importance [S] float32
+          diag: some diagnostics (optional)
+        """
+        L, H, D = int(Q_final.shape[0]), int(Q_final.shape[1]), int(Q_final.shape[2])
+        S = int(pos_global.shape[0])
+        if S == 0:
+            raise ValueError("Empty global sequence length S")
+
+        # choose layers
+        if layers_sel == "last1":
+            layer_ids = [L-1]
+        elif layers_sel == "last4":
+            layer_ids = list(range(max(L-4, 0), L))
+        else:
+            layer_ids = list(range(L))
+        L_sel = len(layer_ids)
+
+        # derive GQA group size: Hkv taken from K_global[0].shape[0]
+        H_kv = int(K_global[layer_ids[0]].shape[0])
+        group_size = H // H_kv
+        if group_size * H_kv != H:
+            # fallback to repeat (rare)
+            group_size = 1
+
+        # output per-layer aggregated [S]
+        layer_scores = np.empty((L_sel, S), dtype=np.float32)
+
+        # precompute sqrt(D)
+        scale = 1.0 / math.sqrt(float(D))
+
+        # per layer
+        ell = 0
+        for li in layer_ids:
+            K_l = K_global[li].astype(np.float32, copy=False)        # [H_kv, S, D] fp32
+            Q_l = Q_final[li].astype(np.float32, copy=False)         # [H, D]
+            # per head logits -> softmax -> attention over S
+            # We'll aggregate across heads as we go
+            if agg_heads == "lse":
+                # log-sum-exp over heads -> use logits then combine
+                head_vals = np.empty((H, S), dtype=np.float32)
+                for h in range(H):
+                    g = h // group_size
+                    q = Q_l[h, :]                                    # [D]
+                    z = K_l[g, :, :] @ q                             # [S]
+                    z = z * scale
+                    a = self._softmax_1d_safe(z)                     # [S]
+                    head_vals[h, :] = a
+                # aggregate heads: lse or mean; use lse for "lse"
+                # log-sum-exp in prob-space ~ sum
+                a_heads = np.log(np.sum(head_vals, axis=0) + 1e-30)  # [S]
+                a_heads = np.exp(a_heads, dtype=np.float32)          # back to prob-like scale
+            else:
+                # max over heads (default)
+                head_max = np.zeros((S,), dtype=np.float32)
+                for h in range(H):
+                    g = h // group_size
+                    q = Q_l[h, :]
+                    z = K_l[g, :, :] @ q                             # [S]
+                    z = z * scale
+                    a = self._softmax_1d_safe(z)                     # [S]
+                    # max across heads
+                    head_max = np.maximum(head_max, a)
+                a_heads = head_max                                   # [S]
+
+            layer_scores[ell, :] = a_heads
+            ell += 1
+
+        # mean across layers
+        importance = np.mean(layer_scores, axis=0, dtype=np.float32)  # [S]
+
+        # optional smoothing (simple moving average)
+        if smooth_window is not None and smooth_window > 1:
+            w = int(smooth_window)
+            pad = w // 2
+            # pad edges by reflection
+            padded = np.pad(importance, (pad, pad), mode="edge")
+            csum = np.cumsum(padded, dtype=np.float32)
+            sm = (csum[w:] - csum[:-w]) / float(w)
+            importance = sm.astype(np.float32, copy=False)
+
+        # diagnostics
+        diag = {}
+        if os.getenv("QEFF_SPEC_ASSERT", ""):
+            # quick softmax sanity on one head (first layer/head)
+            g0 = 0
+            q0 = Q_final[layer_ids[0], 0, :].astype(np.float32, copy=False)
+            z0 = (K_global[layer_ids[0]][g0, :, :].astype(np.float32, copy=False) @ q0) * scale
+            a0 = self._softmax_1d_safe(z0)
+            diag["softmax_sum_l0h0"] = float(np.sum(a0))
+        return importance, diag
+
+    # ---------- NEW: top-% selection ----------
+    def _select_global_topk(
+        self,
+        importance: np.ndarray,      # [S] float32
+        keep_fraction: float,
+        *,
+        force_last: bool = True
+    ) -> np.ndarray:
+        S = int(importance.shape[0])
+        k = max(1, int(math.ceil(keep_fraction * S)))
+        # top-k by partial argpartition
+        idx = np.argpartition(-importance, k-1)[:k]
+        idx.sort()
+        if force_last and (S-1) not in idx:
+            # insert last; maintain sort
+            idx = np.unique(np.concatenate([idx, np.array([S-1], dtype=idx.dtype)]))
+        return idx
+
     # ---- helper: get last token id+text from a prefill outputs dict ----
     @staticmethod
     def _next_token_from_outputs(outputs: Dict[str, Any], tokenizer) -> Tuple[Optional[int], Optional[str]]:
@@ -415,129 +624,97 @@ class SpecPrefillEngine:
         self,
         prompt: str,
         *,
-        pool_kernel_size: int = 13,
+        pool_kernel_size: int = 13,     # kept but unused in the global path
         keep_cfg: Optional[KeepConfig] = None,
-        global_score: bool = False,
+        layers_sel: str = "all",         # "all"|"last4"|"last1"
     ) -> Dict[str, Any]:
-        """Run spec prefill, compute importance and select keep indices."""
+        """
+        Run spec prefill, stitch global keys, compute importance and select keep indices (paper-faithful).
+        """
         if keep_cfg is None:
             keep_cfg = KeepConfig(strategy="percentage", percentage=0.1, chunk=True, chunk_size=32)
 
-        outputs, position_ids, _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
-        spec_last_tok_id, spec_last_tok_text = self._next_token_from_outputs(outputs, self.tokenizer)
-        orig_seq_len = int(position_ids.max())
+        # 1) Run prefill loop, collect per-chunk outputs & pos ids
+        #    We reuse run_prefill's chunk loop by copying logic inline to collect data
+        inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
+        pos_ids_first = inputs["attention_mask"].sum(1, keepdims=True)
+        padded_len = inputs["input_ids"].shape[1]
+        num_chunks = -(padded_len // -self._prefill_seq_len)
+        padded_len = num_chunks * self._prefill_seq_len
 
-        tensors = self.collect_for_scoring(outputs)
-        q = tensors["prefill_queries"]      # [L,H,D] (final-token query)
-        keys_raw = tensors["past_keys"]     # [1,H_kv,capacity_seq_len,D] (one window: last chunk)
-        if len(keys_raw) == 0:
-            raise KeyError("No past_key.{i}_RetainedState outputs to score against")
-
-        capacity_seq_len = int(keys_raw[0].shape[2])
-
-        offset = max(0, orig_seq_len - capacity_seq_len)
-        keys = (
-            keys_raw
-            if capacity_seq_len <= orig_seq_len
-            else [k[:, :, :orig_seq_len, :].copy() for k in keys_raw]
-        )
-        S_eff = min(capacity_seq_len, orig_seq_len)
-
-        if not global_score:
-            imp = self.compute_importance(q, keys, pool_kernel_size=pool_kernel_size)  # [S_eff]
-            if imp.shape[0] > S_eff:
-                imp = imp[:S_eff]
-            assert np.isfinite(imp).all(), "importance contains non-finite values"
-            assert float(imp.sum()) > 0.0, "importance sums to zero"
-            keep_idx_local = self.select_tokens(imp, keep_cfg)
-            if keep_idx_local.size > 0:
-                assert keep_idx_local.dtype == np.int64
-                assert keep_idx_local.min() >= 0
-                assert keep_idx_local.max() < S_eff
-            keep_idx = keep_idx_local + offset
-            imp_out = imp
-        else:
-            imp_out = np.zeros((orig_seq_len,), dtype=np.float32)
-            enc = self.tokenizer(prompt, return_tensors="np", padding=True)
-            padded_len = enc["input_ids"].shape[1]
-            num_chunks = -(padded_len // -self._prefill_seq_len)
-            padded_len = num_chunks * self._prefill_seq_len
-            enc = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-            enc["position_ids"] = np.where(enc.pop("attention_mask"), np.arange(padded_len), -1)
-            enc.pop("token_type_ids", None)
-            logits_out_placeholder = np.zeros((1, 1, self._vocab_size), dtype=np.float32)
+        # pre-allocate logit buffer (as in run_prefill)
+        try:
+            vocab_size = self._fetch_vocab_size()
+            logits_out_placeholder = np.zeros((1, 1, vocab_size), dtype=np.float32)
             self._session.set_buffers({"logits": logits_out_placeholder})
-            for j in range(num_chunks):
-                start = j * self._prefill_seq_len
-                end = min(start + self._prefill_seq_len, orig_seq_len)
-                if end <= start:
+        except Exception:
+            pass
+
+        inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
+        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
+        inputs.pop("token_type_ids", None)
+
+        # Collect containers
+        chunks_keys: List[List[np.ndarray]] = []   # list per-chunk of per-layer key arrays
+        chunks_pos:  List[np.ndarray] = []         # list per-chunk pos_ids
+        outputs_last = None
+
+        for i in range(num_chunks):
+            chunk_inputs = inputs.copy()
+            chunk_inputs["input_ids"] = inputs["input_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len]
+            chunk_inputs["position_ids"] = inputs["position_ids"][:, i*self._refill_seq_len:(i+1)*self._prefill_seq_len] if False else inputs["position_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len]  # typo guard
+            outputs = self._session.run(chunk_inputs)
+            outputs_last = outputs  # save last-chunk outputs to get Q_final
+            # collect per-layer keys for this chunk
+            per_layer_keys: List[np.ndarray] = []
+            idx = 0
+            while True:
+                key_name = f"past_key.{idx}_RetainedState"
+                if key_name not in outputs:
                     break
-                chunk_inputs = {
-                    "input_ids": enc["input_ids"][:, start : start + self._prefill_seq_len],
-                    "position_ids": enc["position_ids"][:, start : start + self._prefill_seq_len],
-                }
-                out_j = self._session.run(chunk_inputs)
-                keys_j = []
-                idx = 0
-                while True:
-                    name = f"past_key.{idx}_RetainedState"
-                    if name not in out_j:
-                        break
-                    keys_j.append(out_j[name])
-                    idx += 1
-                if not keys_j:
-                    continue
-                S_j = int(keys_j[0].shape[2])
-                valid_len = end - start
-                if valid_len <= 0:
-                    continue
-                if S_j > valid_len:
-                    keys_j = [k[:, :, :valid_len, :].copy() for k in keys_j]
-                    S_j = valid_len
+                per_layer_keys.append(outputs[key_name])  # [1,H_kv,S_chunk,D] float16
+                idx += 1
+            chunks_keys.append(per_layer_keys)
+            chunks_pos.append(chunk_inputs["position_ids"].copy())
 
-                imp_j = self.compute_importance(
-                    q, keys_j, pool_kernel_size=pool_kernel_size
-                )  # [S_j]
-                if imp_j.shape[0] > S_j:
-                    imp_j = imp_j[:S_j]
+        if outputs_last is None:
+            raise RuntimeError("No outputs from prefill; empty prompt?")
 
-                sl = slice(start, start + S_j)
-                imp_out[sl] = np.maximum(imp_out[sl], imp_j.astype(np.float32, copy=False))
-            assert np.isfinite(imp_out).all(), "global importance contains non-finite values"
-            assert float(imp_out.sum()) > 0.0, "global importance sums to zero"
-            keep_idx = self.select_tokens(imp_out, keep_cfg)
+        # 2) Fetch Q_final (prefill_queries) from last chunk
+        if "prefill_queries" not in outputs_last:
+            raise KeyError("prefill_queries not in last-chunk outputs")
+        Q_final = outputs_last["prefill_queries"]  # expected [L, H, D] or similar
+        if Q_final.ndim == 4 and Q_final.shape[1] == 1:
+            Q_final = Q_final[:, 0, :, :]  # squeeze batch if needed
 
-        if keep_idx.size == 0 or keep_idx[-1] != (orig_seq_len - 1):
-            keep_idx = np.unique(
-                np.concatenate([keep_idx, np.array([orig_seq_len - 1], dtype=np.int64)])
-            )
+        # 3) Assemble global keys per layer & global pos ids
+        K_global, pos_global, S_total, H_kv, D = self._assemble_global_keys(chunks_keys, chunks_pos)
 
-        if os.getenv("QEFF_SPEC_DEBUG", ""):
-            if not global_score:
-                kept_pct = (100.0 * len(keep_idx) / (S_eff if S_eff > 0 else 1.0))
-                print(
-                    f"[spec:score] orig_seq_len={orig_seq_len} window(S_eff)={S_eff} offset={offset} "
-                    f"kept={len(keep_idx)} ({kept_pct:.1f}%) [window]"
-                )
-            else:
-                kept_pct = (100.0 * len(keep_idx) / (orig_seq_len if orig_seq_len > 0 else 1.0))
-                print(
-                    f"[spec:score] orig_seq_len={orig_seq_len} windows={num_chunks} "
-                    f"kept={len(keep_idx)} ({kept_pct:.1f}%) [global]"
-                )
-            print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
+        # 4) Score global importance respecting GQA; aggregate heads/layers; optional smoothing
+        importance, diag = self._score_global_importance(
+            Q_final=Q_final.astype(np.float32, copy=False),
+            K_global=K_global,
+            pos_global=pos_global,
+            layers_sel=layers_sel,
+            agg_heads="max",
+            smooth_window=pool_kernel_size if pool_kernel_size and pool_kernel_size > 1 else None,
+        )
+
+        if os.getenv("QEFF_SPEC_ASSERT", ""):
+            print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
+
+        # 5) Select global top-% (always keep last real token)
+        keep_idx = self._select_global_topk(importance, keep_cfg.percentage, force_last=True)
+        keep_idx = keep_idx.astype(np.int64, copy=False)
 
         return {
-            "importance": imp_out,
-            "keep_idx": keep_idx,
-            "orig_seq_len": orig_seq_len,
+            "importance": importance,         # [S_total]
+            "keep_idx": keep_idx,             # sorted, includes S_total-1
+            "S": S_total,
             "shapes": {
-                "prefill_queries": q.shape,
-                "first_key": (keys_raw[0].shape if len(keys_raw) else None),
-                "window": {"S_cap": capacity_seq_len},
+                "prefill_queries": tuple(Q_final.shape),
+                "first_key": tuple(K_global[0].shape),
             },
-            "spec_last_tok_id": spec_last_tok_id,
-            "spec_last_tok_text": spec_last_tok_text,
         }
 
 
@@ -549,7 +726,7 @@ class SpecPrefillEngine:
         pool_kernel_size: int = 13,
         keep_cfg: Optional[KeepConfig] = None,
         prefill_logit_bs: int = 1,
-        global_score: bool = False,
+        layers_sel: str = "all",
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
@@ -561,14 +738,19 @@ class SpecPrefillEngine:
             prompt,
             pool_kernel_size=pool_kernel_size,
             keep_cfg=keep_cfg,
-            global_score=global_score,
+            layers_sel=layers_sel,
         )
         t_spec_end = time.perf_counter()
         ttft_spec_only_s = t_spec_end - t_spec_start
         keep_idx = res["keep_idx"]
-        orig_seq_len = res["orig_seq_len"]
-        spec_last_tok_id = res.get("spec_last_tok_id")
-        spec_last_tok_text = res.get("spec_last_tok_text")
+        S = res["S"]
+        if os.getenv("QEFF_SPEC_ASSERT", ""):
+            imp = res["importance"]
+            assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
+            if keep_idx.size > 0:
+                assert keep_idx.min() >= 0, "negative keep index"
+                assert keep_idx.max() < S, f"keep_idx contains out-of-range indices: {keep_idx.max()} >= {S}"
+                assert keep_idx[-1] == S-1, f"must keep last token: got keep_idx[-1]={keep_idx[-1]} vs S-1={S-1}"
         enc = self.tokenizer(prompt, return_tensors="np")
         final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
         final_pos = keep_idx.reshape(1, -1).astype(np.int64)
@@ -587,7 +769,7 @@ class SpecPrefillEngine:
                 )
                 t_preview = tok_list[:32]
                 print(
-                    f"[spec:pruned] kept={len(ids_list)}/{orig_seq_len} keep_idx[:32]={k_preview}"
+                    f"[spec:pruned] kept={len(ids_list)}/{S} keep_idx[:32]={k_preview}"
                 )
                 print(f"[spec:pruned] tokens[:32]={t_preview}")
                 txt_preview = self.tokenizer.decode(ids_list, skip_special_tokens=True)
@@ -613,29 +795,15 @@ class SpecPrefillEngine:
 
         # Always print a compact TTFT summary (ms)
         print(
-            f"[4.3] orig_seq_len={orig_seq_len} kept={keep_idx.size} "
+            f"[4.3] S={S} kept={keep_idx.size} "
             f"TTFT(base_full)={ttft_baseline_s*1000:.1f}ms  "
             f"TTFT(spec_only)={ttft_spec_only_s*1000:.1f}ms  "
             f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms  "
             f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
         )
 
-        # Debug: print spec and base last tokens for direct comparison
-        try:
-            import os
-            if os.getenv("QEFF_SPEC_DEBUG", ""):
-                base_full_id, base_full_text = self._next_token_from_outputs(out_base_full, self.tokenizer)
-                base_pruned_id, base_pruned_text = self._next_token_from_outputs(out_base_pruned, self.tokenizer)
-                print(f"[spec:last] id={spec_last_tok_id} text={spec_last_tok_text!r}")
-                print(
-                    f"[base:last] full_id={base_full_id} full_text={base_full_text!r}  "
-                    f"pruned_id={base_pruned_id} pruned_text={base_pruned_text!r}"
-                )
-        except Exception:
-            pass
-
         return {
-            "orig_seq_len": orig_seq_len,
+            "S": S,
             "kept": int(keep_idx.size),
             "keep_idx": keep_idx,
             "ttft_baseline_s": ttft_baseline_s,
@@ -644,12 +812,6 @@ class SpecPrefillEngine:
             "ttft_speculative_s": ttft_speculative_s,
             "padded_len_pruned": padded_len,
             "num_chunks_pruned": num_chunks,
-            "spec_last_tok_id": spec_last_tok_id,
-            "spec_last_tok_text": spec_last_tok_text,
-            "base_last_full_id": base_full_id if 'base_full_id' in locals() else None,
-            "base_last_full_text": base_full_text if 'base_full_text' in locals() else None,
-            "base_last_pruned_id": base_pruned_id if 'base_pruned_id' in locals() else None,
-            "base_last_pruned_text": base_pruned_text if 'base_pruned_text' in locals() else None,
         }
 
 
@@ -721,28 +883,28 @@ def main() -> None:
     )
 
     # Minimal anti-padding invariants
-    orig_seq_len = res["orig_seq_len"]
+    S = res["S"]
     imp = res["importance"]
     keep_idx = res["keep_idx"]
     assert (
-        imp.shape[0] == orig_seq_len
-    ), f"importance len {imp.shape[0]} != orig_seq_len {orig_seq_len}"
+        imp.shape[0] == S
+    ), f"importance len {imp.shape[0]} != S {S}"
     if keep_idx.size > 0:
         assert (
             keep_idx.dtype == np.int64
         ), f"keep_idx dtype {keep_idx.dtype} != np.int64"
         assert keep_idx.min() >= 0, f"negative keep index {keep_idx.min()}"
         assert (
-            keep_idx.max() < orig_seq_len
-        ), f"padded index detected: {keep_idx.max()} >= orig_seq_len {orig_seq_len}"
+            keep_idx.max() < S
+        ), f"padded index detected: {keep_idx.max()} >= S {S}"
         assert (
-            keep_idx[-1] == orig_seq_len - 1
-        ), f"must keep last real token {orig_seq_len-1}; got {keep_idx[-1]}"
+            keep_idx[-1] == S - 1
+        ), f"must keep last real token {S-1}; got {keep_idx[-1]}"
 
     # One-line summary (quiet by default)
-    kept_pct = (100.0 * len(keep_idx) / orig_seq_len) if orig_seq_len > 0 else 0.0
+    kept_pct = (100.0 * len(keep_idx) / S) if S > 0 else 0.0
     print(
-        f"[score] orig_seq_len={orig_seq_len} kept={len(keep_idx)} ({kept_pct:.1f}%) "
+        f"[score] S={S} kept={len(keep_idx)} ({kept_pct:.1f}%) "
         f"prefill_queries={res['shapes']['prefill_queries']} "
         f"first_key={res['shapes']['first_key']} "
         f"last_kept={keep_idx[-1] if keep_idx.size else 'NA'}"

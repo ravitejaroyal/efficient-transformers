@@ -46,8 +46,10 @@ def main() -> None:
         "--no-chunk", action="store_true", help="Disable chunked keep; use per-token percentage."
     )
     parser.add_argument(
-        "--global-score", action="store_true",
-        help="Two-pass spec scoring over all windows; keep percentage over the entire prompt."
+        "--layers-for-scoring",
+        default="all",
+        choices=["all", "last4", "last1"],
+        help="Which layers to use for host scoring aggregation."
     )
     args = parser.parse_args()
 
@@ -116,7 +118,7 @@ def main() -> None:
         pool_kernel_size=13,
         keep_cfg=keep_cfg,
         prefill_logit_bs=1,
-        global_score=args.global_score,
+        layers_sel=args.layers_for_scoring,
     )
     print("[k=0 integration]", ret)
 
