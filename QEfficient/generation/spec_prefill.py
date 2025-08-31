@@ -236,8 +236,6 @@ class SpecPrefillEngine:
         last_logits = outputs["logits"][0, -1]
         token_id = int(last_logits.argmax())
         token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-        import os
-
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             print(f"[spec:prefill] final token: {token_text!r}", flush=True)
         return outputs, position_ids, generation_len
@@ -567,8 +565,6 @@ class SpecPrefillEngine:
         ), f"avg_pool1d_same produced length {attn.shape[-1]} != expected {S}"
 
         # Optional numerics check: softmax sums ~1 along last axis
-        import os
-
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             if not pool_kernel_size or pool_kernel_size <= 1:
                 sums = np.sum(attn, axis=-1)
@@ -637,7 +633,6 @@ class SpecPrefillEngine:
         # 1) Run prefill loop, collect per-chunk outputs & pos ids
         #    We reuse run_prefill's chunk loop by copying logic inline to collect data
         inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
-        pos_ids_first = inputs["attention_mask"].sum(1, keepdims=True)
         padded_len = inputs["input_ids"].shape[1]
         num_chunks = -(padded_len // -self._prefill_seq_len)
         padded_len = num_chunks * self._prefill_seq_len
@@ -766,8 +761,6 @@ class SpecPrefillEngine:
 
         # ---- debug: print pruned tokens that will be fed to the base (IDs & tokens) ----
         try:
-            import os
-
             if os.getenv("QEFF_SPEC_DEBUG", ""):
                 ids_list = final_ids[0].tolist()
                 tok_list = self.tokenizer.convert_ids_to_tokens(ids_list)
