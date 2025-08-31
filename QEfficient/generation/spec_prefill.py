@@ -193,10 +193,35 @@ class SpecPrefillEngine:
 
         max_gen_len = self._ctx_len - position_ids.max()
         generation_len = self._fetch_generation_len(generation_len, max_gen_len)
+        # Bind persistent output buffers for logits and prefill_queries so the
+        # runtime always sees real buffers for every chunk.
+        logits_out_placeholder = np.zeros(
+            (prefill_logit_bs, 1, self._vocab_size), dtype=np.float32
+        )
+        self._session.set_buffers({"logits": logits_out_placeholder})
 
-        # NOTE: we will only bind a logits placeholder on the FINAL chunk (if we
-        # print the final token). Per-chunk gating of outputs is handled inside
-        # the loop.
+        # --- IMPORTANT: bind a real buffer for 'prefill_queries' for ALL chunks ---
+        # Some QPCs mark this output as non-partial; a zero-length buffer will fail setData.
+        try:
+            if "prefill_queries" in self._session.binding_index_map:
+                idx = self._session.binding_index_map["prefill_queries"]
+                # Prefer allowed_shapes for dimensions; fall back to selected binding dims
+                if self._session.allowed_shapes:
+                    dims = list(self._session.allowed_shapes[0][idx][1])
+                else:
+                    dims = list(self._session.bindings[idx].dims)
+                # 'prefill_queries' is exported as FP32 in our exporter
+                pq_placeholder = np.empty(tuple(dims), dtype=np.float32)
+                self._session.set_buffers({"prefill_queries": pq_placeholder})
+                if os.getenv("QEFF_SPEC_DEBUG", ""):
+                    print(
+                        f"[spec:gate] prefill_queries bound with dims={tuple(dims)} dtype=float32",
+                        flush=True,
+                    )
+        except Exception as e:
+            # Do not crash if binding info is unavailable; let the next run() raise a clearer error
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                print(f"[spec:gate] prefill_queries binding skipped due to: {e}", flush=True)
 
         inputs = self.tokenizer(
             prompt, return_tensors="np", padding="max_length", max_length=padded_len
@@ -273,32 +298,7 @@ class SpecPrefillEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
-
-            # ---- per-chunk output gating: only the LAST chunk produces 'prefill_queries'
-            gate_names = ["prefill_queries"]
-            if want_logits:
-                gate_names.append("logits")
-            if i != num_chunks - 1:
-                # Non-final: skip these outputs entirely
-                self._session.skip_buffers(gate_names)
-            else:
-                # Final: restore prefill_queries (and logits if needed) to proper buffers+dims
-                self._session.enable_outputs(["prefill_queries"])
-                if os.getenv("QEFF_SPEC_DEBUG", ""):
-                    idx = self._session.binding_index_map.get("prefill_queries")
-                    if idx is not None:
-                        print(
-                            "[spec:gate] prefill_queries buf_dims restored to",
-                            self._session.buf_dims[idx],
-                            flush=True,
-                        )
-                if want_logits:
-                    # either restore via enable_outputs OR provide a placeholder
-                    # choose one path; here we re-bind logits as placeholder
-                    logits_out_placeholder = np.zeros(
-                        (prefill_logit_bs, 1, self._vocab_size), dtype=np.float32
-                    )
-                    self._session.set_buffers({"logits": logits_out_placeholder})
+            # NOTE: 'prefill_queries' is bound every chunk but only needed on the last one.
 
             # Re-enable past_key.* only for the final chunk to fetch the full retained state once
             if i == num_chunks - 1 and keep_layers:
