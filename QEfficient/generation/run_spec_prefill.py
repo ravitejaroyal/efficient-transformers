@@ -80,6 +80,8 @@ def main() -> None:
         ctx_len=int(args.ctx_len),
         device_id=spec_device_ids,
     )
+    # Set which layers to keep for scoring
+    spec._layers_sel = args.layers_for_scoring
     base = TextGeneration(
         tokenizer=tokenizer,
         qpc_path=args.base_qpc,

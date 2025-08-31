@@ -71,6 +71,11 @@ class SpecPrefillEngine:
         self.tokenizer = tokenizer
         self._set_tokenizer_params()
 
+        # Which layers to fetch for host scoring ("all", "last4", "last1"); default "all"
+        self._layers_sel: str = "all"
+        # Actual layer indices kept after skip_buffers (computed in run_prefill)
+        self._kept_layers: List[int] = []
+
         # Cache for first prefill pass: assembled later in run_prefill()
         # keys: chunks_keys(List[List[np.ndarray]]), chunks_pos(List[np.ndarray]),
         #       chunks_ids(List[np.ndarray]), Q_final(np.ndarray)
@@ -217,6 +222,38 @@ class SpecPrefillEngine:
                 inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(
                     self.batch_size, 1
                 )
+        # Determine which past_key.*_RetainedState to keep and skip the rest
+        pk_names = [
+            n
+            for n in self._session.output_names
+            if n.startswith("past_key.") and n.endswith("_RetainedState")
+        ]
+        present_layers = sorted(
+            {int(n.split(".")[1].split("_")[0]) for n in pk_names}
+        )
+        keep_layers: List[int] = []
+        if present_layers:
+            L = max(present_layers) + 1
+            if self._layers_sel == "last1":
+                keep_layers = [L - 1]
+            elif self._layers_sel == "last4":
+                keep_layers = list(range(max(L - 4, 0), L))
+            else:
+                keep_layers = list(range(L))
+            to_skip = [
+                f"past_key.{i}_RetainedState" for i in present_layers if i not in keep_layers
+            ]
+            if to_skip:
+                self._session.skip_buffers(to_skip)
+        self._kept_layers = keep_layers
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                print(
+                    f"[spec] layers_sel={self._layers_sel}  kept_layers={self._kept_layers}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         # Collect per-chunk tensors for host scoring
         chunks_keys: List[List[np.ndarray]] = []
@@ -235,15 +272,12 @@ class SpecPrefillEngine:
             outputs = self._session.run(chunk_inputs)
             outputs_last = outputs
 
-            # harvest per-layer keys for this chunk
+            # harvest per-layer keys for this chunk (only kept layers)
             per_layer_keys: List[np.ndarray] = []
-            li = 0
-            while True:
+            for li in self._kept_layers:
                 key_name = f"past_key.{li}_RetainedState"
-                if key_name not in outputs:
-                    break
-                per_layer_keys.append(outputs[key_name])  # [1,H_kv,S_chunk,D] fp16
-                li += 1
+                if key_name in outputs:
+                    per_layer_keys.append(outputs[key_name])
             if len(per_layer_keys) == 0:
                 raise RuntimeError("No past_key.*_RetainedState found in prefill outputs")
             chunks_keys.append(per_layer_keys)
@@ -704,6 +738,8 @@ class SpecPrefillEngine:
         chunks_pos = self._prefill_cache["chunks_pos"]
         chunks_ids = self._prefill_cache["chunks_ids"]
         Q_final = self._prefill_cache["Q_final"]
+        if self._kept_layers:
+            Q_final = Q_final[self._kept_layers, :, :]
 
         K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
             chunks_keys, chunks_pos, chunks_ids
