@@ -51,6 +51,18 @@ def main() -> None:
         choices=["all", "last4", "last1"],
         help="Which layers to use for host scoring aggregation."
     )
+    # Optional: print and/or save pruned-path base model output (for verification)
+    parser.add_argument(
+        "--print-pruned-output",
+        action="store_true",
+        help="Print the base model decode output after pruned prefill (speculative path).",
+    )
+    parser.add_argument(
+        "--save-pruned-output",
+        type=str,
+        default=None,
+        help="If set, save the pruned-path base decode text to this file.",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("QEFF_SPEC_DEBUG", "1")
@@ -123,7 +135,44 @@ def main() -> None:
         layers_sel=args.layers_for_scoring,
         gen_len=int(args.gen_len) if args.gen_len is not None else None,
     )
-    print("[k=0 integration]", ret)
+
+    # --- Pretty, accurate TTFT breakdown ---
+    try:
+        S = ret.get("S", None)
+        kept = ret.get("kept", None)
+        ttft_base_full_ms = ret["ttft_baseline_s"] * 1000.0
+        ttft_spec_only_ms = ret["ttft_spec_only_s"] * 1000.0  # spec device prefill + host assemble/score
+        ttft_base_pruned_ms = ret["ttft_base_pruned_only_s"] * 1000.0
+        ttft_spec_total_ms = ret["ttft_speculative_s"] * 1000.0
+
+        print("\n[TTFT]")
+        if S is not None and kept is not None:
+            print(f"  S={S}  kept={kept}")
+        print(
+            "  base_full={:.1f} ms | spec_device+host={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
+            .format(ttft_base_full_ms, ttft_spec_only_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
+        )
+    except Exception as e:
+        print(f"[TTFT] warning: could not format timing breakdown ({e}); raw ret: {ret}")
+
+    # --- Optional: print/save pruned-path base decode output for verification ---
+    gen_txt = ret.get("generated_text_pruned", None)
+    if gen_txt is not None:
+        if args.print_pruned_output:
+            # Print a trimmed preview (avoid flooding console on long outputs)
+            preview = gen_txt if len(gen_txt) <= 400 else (gen_txt[:400] + " …")
+            print("\n[pruned:base:output]")
+            print(preview)
+        if args.save_pruned_output:
+            try:
+                with open(args.save_pruned_output, "w", encoding="utf-8") as fh:
+                    fh.write(gen_txt)
+                print(f"[pruned:base:output] saved to {args.save_pruned_output}")
+            except Exception as e:
+                print(f"[pruned:base:output] failed to save to {args.save_pruned_output}: {e}")
+    else:
+        if args.print_pruned_output or args.save_pruned_output:
+            print("[pruned:base:output] no generated_text_pruned present; ensure --gen-len > 0 was passed through.")
 
 
 if __name__ == "__main__":
