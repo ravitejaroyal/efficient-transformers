@@ -449,15 +449,20 @@ class SpecPrefillEngine:
         # mean across layers
         importance = np.mean(layer_scores, axis=0, dtype=np.float32)  # [S]
 
-        # optional smoothing (simple moving average)
+        # optional smoothing (simple moving average; length-preserving)
         if smooth_window is not None and smooth_window > 1:
             w = int(smooth_window)
-            pad = w // 2
-            # pad edges by reflection
-            padded = np.pad(importance, (pad, pad), mode="edge")
-            csum = np.cumsum(padded, dtype=np.float32)
-            sm = (csum[w:] - csum[:-w]) / float(w)
-            importance = sm.astype(np.float32, copy=False)
+            S = importance.shape[0]
+            # Clamp window to sequence length to avoid shrinking output
+            w = max(1, min(w, S))
+            if w > 1:
+                # Uniform kernel and same-length convolution
+                kernel = np.ones((w,), dtype=np.float32) / float(w)
+                importance = np.convolve(importance, kernel, mode="same").astype(
+                    np.float32, copy=False
+                )
+            # hard invariant: preserve length
+            assert importance.shape[0] == S, f"smoothing altered length: {importance.shape[0]} != {S}"
 
         # diagnostics
         diag = {}
