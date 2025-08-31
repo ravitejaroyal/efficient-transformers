@@ -71,6 +71,11 @@ class SpecPrefillEngine:
         self.tokenizer = tokenizer
         self._set_tokenizer_params()
 
+        # Cache for first prefill pass: assembled later in run_prefill()
+        # keys: chunks_keys(List[List[np.ndarray]]), chunks_pos(List[np.ndarray]),
+        #       chunks_ids(List[np.ndarray]), Q_final(np.ndarray)
+        self._prefill_cache: Optional[Dict[str, Any]] = None
+
         # Speculative prefill uses past_key.* for scoring; skip past_* inputs and past_value outputs.
         past_inputs = [n for n in self._session.input_names if n.startswith("past_")]
         past_outs = [n for n in self._session.output_names if n.startswith("past_value.")]
@@ -213,6 +218,12 @@ class SpecPrefillEngine:
                     self.batch_size, 1
                 )
 
+        # Collect per-chunk tensors for host scoring
+        chunks_keys: List[List[np.ndarray]] = []
+        chunks_pos: List[np.ndarray] = []
+        chunks_ids: List[np.ndarray] = []
+        outputs_last = None
+
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
             chunk_inputs["input_ids"] = inputs["input_ids"][
@@ -222,6 +233,23 @@ class SpecPrefillEngine:
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
             outputs = self._session.run(chunk_inputs)
+            outputs_last = outputs
+
+            # harvest per-layer keys for this chunk
+            per_layer_keys: List[np.ndarray] = []
+            li = 0
+            while True:
+                key_name = f"past_key.{li}_RetainedState"
+                if key_name not in outputs:
+                    break
+                per_layer_keys.append(outputs[key_name])  # [1,H_kv,S_chunk,D] fp16
+                li += 1
+            if len(per_layer_keys) == 0:
+                raise RuntimeError("No past_key.*_RetainedState found in prefill outputs")
+            chunks_keys.append(per_layer_keys)
+            chunks_pos.append(chunk_inputs["position_ids"].copy())
+            chunks_ids.append(chunk_inputs["input_ids"].copy())
+
             if self._write_io_dir is not None:
                 write_io_files(
                     inputs,
@@ -233,12 +261,32 @@ class SpecPrefillEngine:
                     False,
                 )
 
-        last_logits = outputs["logits"][0, -1]
+        if outputs_last is None:
+            raise RuntimeError("No outputs from prefill; empty prompt?")
+
+        last_logits = outputs_last["logits"][0, -1]
         token_id = int(last_logits.argmax())
         token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             print(f"[spec:prefill] final token: {token_text!r}", flush=True)
-        return outputs, position_ids, generation_len
+
+        # Cache Q_final (prefill_queries from last chunk)
+        if "prefill_queries" not in outputs_last:
+            raise KeyError("prefill_queries not found in last prefill outputs")
+        Q_final = outputs_last["prefill_queries"]
+        if Q_final.ndim == 4 and Q_final.shape[1] == 1:
+            # squeeze batch if present
+            Q_final = Q_final[:, 0, :, :]
+
+        # store cache for host scoring
+        self._prefill_cache = {
+            "chunks_keys": chunks_keys,
+            "chunks_pos": chunks_pos,
+            "chunks_ids": chunks_ids,
+            "Q_final": Q_final,
+        }
+
+        return outputs_last, position_ids, generation_len
 
     # --- helper to collect tensors for scoring from a prefill 'outputs' dict ---
     def collect_for_scoring(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -637,59 +685,25 @@ class SpecPrefillEngine:
         keep_cfg: Optional[KeepConfig] = None,
         layers_sel: str = "all",
     ) -> Dict[str, Any]:
-        """Run speculator prefill, stitch global keys, compute importance and select keep indices."""
+        """
+        Run speculator prefill (once if needed), assemble global tensors from cached chunks,
+        host-score, select keep_idx.
+        """
         if keep_cfg is None:
-            keep_cfg = KeepConfig(strategy="percentage", percentage=0.1, chunk=True, chunk_size=32)
+            keep_cfg = KeepConfig()
+        if keep_cfg.strategy != "percentage":
+            raise NotImplementedError(f"keep strategy {keep_cfg.strategy!r}")
 
-        # --- single proper tokenization (mirror run_prefill) ---
-        _probe = self.tokenizer(prompt, return_tensors="np", padding=True)
-        padded_len = int(_probe["input_ids"].shape[1])
-        num_chunks = -(padded_len // -self._prefill_seq_len)
-        padded_len = num_chunks * self._prefill_seq_len
+        # Ensure we have a first-pass cache. If absent, run prefill once to populate.
+        if self._prefill_cache is None:
+            _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
+        if self._prefill_cache is None:
+            raise RuntimeError("Prefill cache missing after run_prefill")
 
-        logits_out_placeholder = np.zeros((1, 1, self._vocab_size), dtype=np.float32)
-        self._session.set_buffers({"logits": logits_out_placeholder})
-
-        full = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-        full["position_ids"] = np.where(full.pop("attention_mask"), np.arange(padded_len), -1)
-        full.pop("token_type_ids", None)
-
-        outputs_last = None
-        chunks_keys: List[List[np.ndarray]] = []
-        chunks_pos: List[np.ndarray] = []
-        chunks_ids: List[np.ndarray] = []
-
-        for ci in range(num_chunks):
-            start_idx = ci * self._prefill_seq_len
-            end_idx = (ci + 1) * self._prefill_seq_len
-            chunk_inputs = {
-                "input_ids": full["input_ids"][:, start_idx:end_idx],
-                "position_ids": full["position_ids"][:, start_idx:end_idx],
-            }
-            outputs = self._session.run(chunk_inputs)
-            if ci == num_chunks - 1:
-                outputs_last = outputs
-
-            per_layer_keys = []
-            idx = 0
-            while True:
-                key_name = f"past_key.{idx}_RetainedState"
-                if key_name not in outputs:
-                    break
-                per_layer_keys.append(outputs[key_name])
-                idx += 1
-            chunks_keys.append(per_layer_keys)
-            chunks_pos.append(chunk_inputs["position_ids"].copy())
-            chunks_ids.append(chunk_inputs["input_ids"].copy())
-
-        if outputs_last is None:
-            raise RuntimeError("No outputs from prefill; empty prompt?")
-
-        if "prefill_queries" not in outputs_last:
-            raise KeyError("prefill_queries not in last-chunk outputs")
-        Q_final = outputs_last["prefill_queries"]
-        if Q_final.ndim == 4 and Q_final.shape[1] == 1:
-            Q_final = Q_final[:, 0, :, :]
+        chunks_keys = self._prefill_cache["chunks_keys"]
+        chunks_pos = self._prefill_cache["chunks_pos"]
+        chunks_ids = self._prefill_cache["chunks_ids"]
+        Q_final = self._prefill_cache["Q_final"]
 
         K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
             chunks_keys, chunks_pos, chunks_ids
@@ -707,20 +721,30 @@ class SpecPrefillEngine:
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
 
+        # Always-on sanity checks (not gated)
+        if importance.shape[0] != S_total:
+            raise AssertionError(f"importance len {importance.shape[0]} != S {S_total}")
+
         keep_idx = self._select_global_topk(importance, keep_cfg.percentage, force_last=True)
-        keep_idx = keep_idx.astype(np.int64, copy=False)
-        if S_total > 0:
-            keep_idx = np.union1d(keep_idx, np.array([S_total - 1], dtype=np.int64))
+        keep_idx = np.union1d(
+            keep_idx.astype(np.int64, copy=False), np.array([S_total - 1], dtype=np.int64)
+        )
+
+        # Post-invariants
+        if keep_idx.size == 0 or keep_idx[-1] != S_total - 1:
+            raise AssertionError("must keep last real token")
+        if keep_idx.min() < 0 or keep_idx.max() >= S_total:
+            raise AssertionError("keep_idx out of range")
 
         return {
-            "importance": importance,
-            "keep_idx": keep_idx,
+            "importance": importance,  # [S_total]
+            "keep_idx": keep_idx,  # sorted, includes S_total-1
             "S": S_total,
             "shapes": {
                 "prefill_queries": tuple(Q_final.shape),
                 "first_key": tuple(K_global[0].shape),
             },
-            "ids_global": ids_global,
+            "ids_global": ids_global,  # [S_total] int64 (exact device-fed tokens)
         }
 
     def prune_and_base_prefill(
