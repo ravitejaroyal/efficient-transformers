@@ -622,81 +622,74 @@ class SpecPrefillEngine:
         return kept
 
 
+    
+
     def prefill_and_score(
         self,
         prompt: str,
         *,
-        pool_kernel_size: int = 13,     # kept but unused in the global path
+        pool_kernel_size: int = 13,
         keep_cfg: Optional[KeepConfig] = None,
-        layers_sel: str = "all",         # "all"|"last4"|"last1"
+        layers_sel: str = "all",
     ) -> Dict[str, Any]:
-        """
-        Run spec prefill, stitch global keys, compute importance and select keep indices (paper-faithful).
-        """
+        """Run speculator prefill, stitch global keys, compute importance and select keep indices."""
         if keep_cfg is None:
             keep_cfg = KeepConfig(strategy="percentage", percentage=0.1, chunk=True, chunk_size=32)
 
-        # 1) Run prefill loop, collect per-chunk outputs & pos ids
-        #    We reuse run_prefill's chunk loop by copying logic inline to collect data
-        inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
-        padded_len = inputs["input_ids"].shape[1]
+        # --- single proper tokenization (mirror run_prefill) ---
+        _probe = self.tokenizer(prompt, return_tensors="np", padding=True)
+        padded_len = int(_probe["input_ids"].shape[1])
         num_chunks = -(padded_len // -self._prefill_seq_len)
         padded_len = num_chunks * self._prefill_seq_len
 
-        # pre-allocate logit buffer (as in run_prefill)
-        try:
-            vocab_size = self._fetch_vocab_size()
-            logits_out_placeholder = np.zeros((1, 1, vocab_size), dtype=np.float32)
-            self._session.set_buffers({"logits": logits_out_placeholder})
-        except Exception:
-            pass
+        logits_out_placeholder = np.zeros((1, 1, self._vocab_size), dtype=np.float32)
+        self._session.set_buffers({"logits": logits_out_placeholder})
 
-        inputs = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
-        inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
-        inputs.pop("token_type_ids", None)
+        full = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=padded_len)
+        full["position_ids"] = np.where(full.pop("attention_mask"), np.arange(padded_len), -1)
+        full.pop("token_type_ids", None)
 
-        # Collect containers
-        chunks_keys: List[List[np.ndarray]] = []   # list per-chunk of per-layer key arrays
-        chunks_pos: List[np.ndarray] = []          # list per-chunk pos_ids
-        chunks_ids: List[np.ndarray] = []          # list per-chunk input_ids slices
         outputs_last = None
+        chunks_keys: List[List[np.ndarray]] = []
+        chunks_pos: List[np.ndarray] = []
+        chunks_ids: List[np.ndarray] = []
 
-        for i in range(num_chunks):
-            chunk_inputs = inputs.copy()
-            chunk_inputs["input_ids"] = inputs["input_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len]
-            chunk_inputs["position_ids"] = inputs["position_ids"][:, i*self._refill_seq_len:(i+1)*self._prefill_seq_len] if False else inputs["position_ids"][:, i*self._prefill_seq_len:(i+1)*self._prefill_seq_len]  # typo guard
+        for ci in range(num_chunks):
+            start_idx = ci * self._prefill_seq_len
+            end_idx = (ci + 1) * self._prefill_seq_len
+            chunk_inputs = {
+                "input_ids": full["input_ids"][:, start_idx:end_idx],
+                "position_ids": full["position_ids"][:, start_idx:end_idx],
+            }
             outputs = self._session.run(chunk_inputs)
-            outputs_last = outputs  # save last-chunk outputs to get Q_final
-            # collect per-layer keys for this chunk
-            per_layer_keys: List[np.ndarray] = []
+            if ci == num_chunks - 1:
+                outputs_last = outputs
+
+            per_layer_keys = []
             idx = 0
             while True:
                 key_name = f"past_key.{idx}_RetainedState"
                 if key_name not in outputs:
                     break
-                per_layer_keys.append(outputs[key_name])  # [1,H_kv,S_chunk,D] float16
+                per_layer_keys.append(outputs[key_name])
                 idx += 1
             chunks_keys.append(per_layer_keys)
             chunks_pos.append(chunk_inputs["position_ids"].copy())
-            # store exact input_ids fed to device for this chunk
             chunks_ids.append(chunk_inputs["input_ids"].copy())
 
         if outputs_last is None:
             raise RuntimeError("No outputs from prefill; empty prompt?")
 
-        # 2) Fetch Q_final (prefill_queries) from last chunk
         if "prefill_queries" not in outputs_last:
             raise KeyError("prefill_queries not in last-chunk outputs")
-        Q_final = outputs_last["prefill_queries"]  # expected [L, H, D] or similar
+        Q_final = outputs_last["prefill_queries"]
         if Q_final.ndim == 4 and Q_final.shape[1] == 1:
-            Q_final = Q_final[:, 0, :, :]  # squeeze batch if needed
+            Q_final = Q_final[:, 0, :, :]
 
-        # 3) Assemble global keys per layer & global pos ids
         K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
             chunks_keys, chunks_pos, chunks_ids
         )
 
-        # 4) Score global importance respecting GQA; aggregate heads/layers; optional smoothing
         importance, diag = self._score_global_importance(
             Q_final=Q_final.astype(np.float32, copy=False),
             K_global=K_global,
@@ -709,21 +702,21 @@ class SpecPrefillEngine:
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
 
-        # 5) Select global top-% (always keep last real token)
         keep_idx = self._select_global_topk(importance, keep_cfg.percentage, force_last=True)
         keep_idx = keep_idx.astype(np.int64, copy=False)
+        if S_total > 0:
+            keep_idx = np.union1d(keep_idx, np.array([S_total - 1], dtype=np.int64))
 
         return {
-            "importance": importance,  # [S_total]
-            "keep_idx": keep_idx,      # sorted, includes S_total-1
+            "importance": importance,
+            "keep_idx": keep_idx,
             "S": S_total,
             "shapes": {
                 "prefill_queries": tuple(Q_final.shape),
                 "first_key": tuple(K_global[0].shape),
             },
-            "ids_global": ids_global,  # [S_total] int64 (exact device-fed tokens)
+            "ids_global": ids_global,
         }
-
 
     def prune_and_base_prefill(
         self,
@@ -753,12 +746,12 @@ class SpecPrefillEngine:
         keep_idx = res["keep_idx"]
         S = res["S"]
         ids_global = res.get("ids_global", None)
-        if os.getenv("QEFF_SPEC_ASSERT", ""):
-            imp = res["importance"]
-            assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
-            assert keep_idx.size > 0 and keep_idx[-1] == S - 1, "must keep last real token"
-            assert keep_idx.min() >= 0 and keep_idx.max() < S, "keep_idx out of range"
-            assert ids_global is not None and ids_global.shape[0] == S, "ids_global missing/mismatch"
+        # Unconditional invariants (catch regressions early)
+        imp = res["importance"]
+        assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
+        assert keep_idx.size > 0 and keep_idx[-1] == S - 1, "must keep last real token"
+        assert keep_idx.min() >= 0 and keep_idx.max() < S, "keep_idx out of range"
+        assert ids_global is not None and ids_global.shape[0] == S, "ids_global missing/mismatch"
         # Build pruned inputs from the *exact* device-fed ids (no re-tokenization)
         if ids_global is None:
             raise RuntimeError("ids_global not present in scoring result")
@@ -838,8 +831,6 @@ class SpecPrefillEngine:
             "num_chunks_pruned": num_chunks,
             "generated_text_pruned": generated_text_pruned,
         }
-
-
 # --------------------- simple __main__ validator ---------------------
 def main() -> None:
     import argparse
