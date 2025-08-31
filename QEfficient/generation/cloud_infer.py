@@ -170,21 +170,20 @@ class QAICInferenceSession:
 
     def enable_outputs(self, names: List[str]):
         """
-        Re-enable reading specific output bindings that were previously skipped,
-        by allocating QBuffers of the compiled size and restoring dims from the
-        selected_set. Use only for OUTPUT bindings.
+        Re-enable previously skipped outputs by recreating QBuffers and restoring
+        ``buf_dims`` from the selected bindings (element size & dims).
         """
         for name in names:
             if name not in self.binding_index_map:
                 continue
             idx = self.binding_index_map[name]
-            binding = self.bindings[idx]
-            # Allocate a QBuffer of the compiled size for this binding
+            binding = self.bindings[idx]  # selected_set binding
+            # Recreate buffer to the selected size
             self.qbuffers[idx] = qaicrt.QBuffer(bytes(binding.size))
-            # Restore dims from the compiled (selected) set
-            # itemsize is already known from type
-            itemsize = aic_to_np_dtype_mapping[binding.type].itemsize
-            self.buf_dims[idx] = (itemsize, list(binding.dims))
+            # Restore buf_dims elem size & dims from the binding
+            elem_size = aic_to_np_dtype_mapping[binding.type].itemsize
+            dims = list(binding.dims)
+            self.buf_dims[idx] = (elem_size, dims)
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
