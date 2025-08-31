@@ -178,21 +178,23 @@ class QAICInferenceSession:
         Return:
             :Dict[str, np.ndarray]:
         """
-        # Set inputs
+        import os
+        import time
+
+        t0 = time.perf_counter()
         self.set_buffers(inputs)
+        t_set = time.perf_counter()
         if (
             self.execObj.setData(self.qbuffers, self.buf_dims)
             != qaicrt.QStatus.QS_SUCCESS
         ):
             raise MemoryError("Failed to setData")
-        # # Run with sync API
-        # if self.execObj.run(self.qbuffers) != qaicrt.QStatus.QS_SUCCESS:
-        # Run with async API
+        t_setdata = time.perf_counter()
         if self.queue.enqueue(self.execObj) != qaicrt.QStatus.QS_SUCCESS:
             raise MemoryError("Failed to enqueue")
+        t_enqueue = time.perf_counter()
         if self.execObj.waitForCompletion() != qaicrt.QStatus.QS_SUCCESS:
             error_message = "Failed to run"
-            # Print additional error messages for unmatched dimension error
             if self.allowed_shapes:
                 error_message += "\n\n"
                 error_message += (
@@ -215,12 +217,13 @@ class QAICInferenceSession:
                         continue
                     error_message += f"{binding.name}:\t{elemsize}\t{shape}\n"
             raise ValueError(error_message)
-        # Get output buffers
+        t_wait = time.perf_counter()
         status, output_qbuffers = self.execObj.getData()
         if status != qaicrt.QStatus.QS_SUCCESS:
             raise MemoryError("Failed to getData")
-        # Build output
+        t_get = time.perf_counter()
         outputs = {}
+        total_bytes = 0
         for output_name in self.output_names:
             buffer_index = self.binding_index_map[output_name]
             if self.qbuffers[buffer_index].size == 0:
@@ -229,6 +232,29 @@ class QAICInferenceSession:
                 bytes(output_qbuffers[buffer_index]),
                 aic_to_np_dtype_mapping[self.bindings[buffer_index].type],
             )
-            # Robust reshape for dynamic output compiled as flat core-tensor
-            outputs[output_name] = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            shaped = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            outputs[output_name] = shaped
+            try:
+                total_bytes += int(arr.size) * arr.itemsize
+            except Exception:
+                pass
+        t_unmarshal = time.perf_counter()
+
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                print(
+                    "[qaic:run] set=%.4f setData=%.4f enqueue=%.4f wait=%.4f get=%.4f unmarshal=%.4f bytes=%.2fMB"
+                    % (
+                        (t_set - t0),
+                        (t_setdata - t_set),
+                        (t_enqueue - t_setdata),
+                        (t_wait - t_enqueue),
+                        (t_get - t_wait),
+                        (t_unmarshal - t_get),
+                        total_bytes / 1e6,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
         return outputs

@@ -255,11 +255,15 @@ class SpecPrefillEngine:
             except Exception:
                 pass
 
+        import os
+        import time
+
         # Collect per-chunk tensors for host scoring
         chunks_keys: List[List[np.ndarray]] = []
         chunks_pos: List[np.ndarray] = []
         chunks_ids: List[np.ndarray] = []
         outputs_last = None
+        per_chunk: List[Tuple[int, float, float, int]] = []
 
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
@@ -269,7 +273,19 @@ class SpecPrefillEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
+            t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
+            t1 = time.perf_counter()
+            mb = 0.0
+            n_out = 0
+            try:
+                for arr in outputs.values():
+                    if isinstance(arr, np.ndarray):
+                        mb += (arr.size * arr.itemsize) / 1e6
+                        n_out += 1
+            except Exception:
+                pass
+            per_chunk.append((i, t1 - t0, mb, n_out))
             outputs_last = outputs
 
             # harvest per-layer keys for this chunk (only kept layers)
@@ -319,6 +335,25 @@ class SpecPrefillEngine:
             "chunks_ids": chunks_ids,
             "Q_final": Q_final,
         }
+
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                total_t = sum(dt for _, dt, _, _ in per_chunk)
+                total_mb = sum(mb for _, _, mb, _ in per_chunk)
+                worst = sorted(per_chunk, key=lambda x: x[1], reverse=True)[:3]
+                print(
+                    "[spec:prefill] chunks=%d  total=%.3fs  avg=%.3fs  out=%.1fMB  worst=%s"
+                    % (
+                        len(per_chunk),
+                        total_t,
+                        total_t / max(1, len(per_chunk)),
+                        total_mb,
+                        [(i, round(dt, 3), round(mb, 1)) for (i, dt, mb, _) in worst],
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         return outputs_last, position_ids, generation_len
 
@@ -728,11 +763,16 @@ class SpecPrefillEngine:
         if keep_cfg.strategy != "percentage":
             raise NotImplementedError(f"keep strategy {keep_cfg.strategy!r}")
 
+        import os
+        import time
+
+        t0 = time.perf_counter()
         # Ensure we have a first-pass cache. If absent, run prefill once to populate.
         if self._prefill_cache is None:
             _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
         if self._prefill_cache is None:
             raise RuntimeError("Prefill cache missing after run_prefill")
+        t1 = time.perf_counter()
 
         chunks_keys = self._prefill_cache["chunks_keys"]
         chunks_pos = self._prefill_cache["chunks_pos"]
@@ -744,6 +784,7 @@ class SpecPrefillEngine:
         K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
             chunks_keys, chunks_pos, chunks_ids
         )
+        t2 = time.perf_counter()
 
         importance, diag = self._score_global_importance(
             Q_final=Q_final.astype(np.float32, copy=False),
@@ -753,6 +794,7 @@ class SpecPrefillEngine:
             agg_heads="max",
             smooth_window=pool_kernel_size if pool_kernel_size and pool_kernel_size > 1 else None,
         )
+        t3 = time.perf_counter()
 
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
@@ -765,6 +807,24 @@ class SpecPrefillEngine:
         keep_idx = np.union1d(
             keep_idx.astype(np.int64, copy=False), np.array([S_total - 1], dtype=np.int64)
         )
+        t4 = time.perf_counter()
+
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                print(
+                    "[spec:host] run_prefill=%.3fs assemble=%.3fs score=%.3fs select=%.3fs S=%d layers_sel=%s"
+                    % (
+                        t1 - t0,
+                        t2 - t1,
+                        t3 - t2,
+                        t4 - t3,
+                        S_total,
+                        layers_sel,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         # Post-invariants
         if keep_idx.size == 0 or keep_idx[-1] != S_total - 1:
