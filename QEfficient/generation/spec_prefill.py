@@ -222,7 +222,7 @@ class SpecPrefillEngine:
                 inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(
                     self.batch_size, 1
                 )
-        # Determine which past_key.*_RetainedState to keep and skip the rest
+        # Determine which past_key.*_RetainedState to keep and skip the rest (default: all)
         pk_names = [
             n
             for n in self._session.output_names
@@ -240,9 +240,8 @@ class SpecPrefillEngine:
                 keep_layers = list(range(max(L - 4, 0), L))
             else:
                 keep_layers = list(range(L))
-            to_skip = [
-                f"past_key.{i}_RetainedState" for i in present_layers if i not in keep_layers
-            ]
+            # Skip ALL kept layers initially; we'll re-enable them only for the *last* chunk
+            to_skip = [f"past_key.{i}_RetainedState" for i in keep_layers]
             if to_skip:
                 self._session.skip_buffers(to_skip)
         self._kept_layers = keep_layers
@@ -273,6 +272,11 @@ class SpecPrefillEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
+            # Re-enable past_key.* only for the final chunk to fetch the full retained state once
+            if i == num_chunks - 1 and keep_layers:
+                self._session.enable_outputs(
+                    [f"past_key.{li}_RetainedState" for li in keep_layers]
+                )
             t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
             t1 = time.perf_counter()
@@ -288,15 +292,7 @@ class SpecPrefillEngine:
             per_chunk.append((i, t1 - t0, mb, n_out))
             outputs_last = outputs
 
-            # harvest per-layer keys for this chunk (only kept layers)
-            per_layer_keys: List[np.ndarray] = []
-            for li in self._kept_layers:
-                key_name = f"past_key.{li}_RetainedState"
-                if key_name in outputs:
-                    per_layer_keys.append(outputs[key_name])
-            if len(per_layer_keys) == 0:
-                raise RuntimeError("No past_key.*_RetainedState found in prefill outputs")
-            chunks_keys.append(per_layer_keys)
+            # record positions and ids for *every* chunk
             chunks_pos.append(chunk_inputs["position_ids"].copy())
             chunks_ids.append(chunk_inputs["input_ids"].copy())
 
@@ -327,6 +323,16 @@ class SpecPrefillEngine:
         if Q_final.ndim == 4 and Q_final.shape[1] == 1:
             # squeeze batch if present
             Q_final = Q_final[:, 0, :, :]
+
+        # Harvest *retained-state* keys *once* from the final chunk (full ctx_len per layer), for kept layers
+        per_layer_keys_last: List[np.ndarray] = []
+        for li in self._kept_layers:
+            key_name = f"past_key.{li}_RetainedState"
+            if key_name not in outputs_last:
+                raise RuntimeError(f"{key_name} missing in last-chunk outputs")
+            per_layer_keys_last.append(outputs_last[key_name])  # [1,H_kv,ctx_len,D]
+        # Store as a single "chunk" (we'll slice to S_total later)
+        chunks_keys = [per_layer_keys_last]
 
         # store cache for host scoring
         self._prefill_cache = {
@@ -413,9 +419,9 @@ class SpecPrefillEngine:
     # ---------- NEW: build global K per layer & global position ids ----------
     def _assemble_global_keys(
         self,
-        chunks_keys: List[List[np.ndarray]],   # len(chunks) list of per-layer key arrays [1,H_kv,S_chunk,D] FP16
-        chunks_pos: List[np.ndarray],          # len(chunks) list of position_ids [1,S_chunk] int64
-        chunks_ids: List[np.ndarray],          # len(chunks) list of input_ids [1,S_chunk] int64 (exactly what was fed)
+        chunks_keys: List[List[np.ndarray]],  # here length may be 1: final-chunk retained state [1,H_kv,ctx_len,D]
+        chunks_pos: List[np.ndarray],         # per-chunk position_ids [1,S_chunk] (pads=-1 in last chunk tail)
+        chunks_ids: List[np.ndarray],         # per-chunk input_ids [1,S_chunk] (exactly what was fed)
     ) -> Tuple[List[np.ndarray], np.ndarray, np.ndarray, int, int, int]:
         """
         Concatenate per-chunk keys per layer along token axis (exclude pads) and build global pos_ids.
@@ -425,7 +431,7 @@ class SpecPrefillEngine:
           pos_global: [S_total] int64 (>=0)
           S_total, H_kv, D
         """
-        # infer shapes from first non-empty chunk/layer
+        # infer layer count from the (single) kept-keys list
         L = len(chunks_keys[0])
         # collect per-layer lists of [H_kv, valid_len_i, D]
         per_layer_buffers: List[List[np.ndarray]] = [[] for _ in range(L)]
@@ -436,40 +442,39 @@ class SpecPrefillEngine:
         D = None
         S_total = 0
 
-        for ci, (keys_per_layer, pos_ids) in enumerate(zip(chunks_keys, chunks_pos)):
-            # pos_ids is [1, S_chunk]
+        # Build global pos & ids from *all* chunks
+        for ci, pos_ids in enumerate(chunks_pos):
             p = pos_ids.reshape(-1).astype(np.int64)
             mask_valid = (p >= 0)
-            valid_len = int(mask_valid.sum())
-            if valid_len == 0:
+            vl = int(mask_valid.sum())
+            if vl == 0:
                 continue
             pos_global_list.append(p[mask_valid])
-            # append the exact input_ids used for this chunk's valid region
             ids_chunk = chunks_ids[ci].reshape(-1).astype(np.int64)
-            ids_global_list.append(ids_chunk[:valid_len])
-            S_total += valid_len
+            ids_global_list.append(ids_chunk[:vl])
+            S_total += vl
 
-            for li in range(L):
-                # chunk key tensor shape [1, H_kv, S_chunk, D]
-                k = keys_per_layer[li]
-                if k is None:
-                    raise RuntimeError(f"Missing keys for layer {li} in chunk {ci}")
-                if H_kv is None or D is None:
-                    H_kv = int(k.shape[1])
-                    D = int(k.shape[3])
-                # slice to valid_len, drop batch dim
-                k_slice = k[0, :, :valid_len, :].astype(np.float16, copy=False)
-                per_layer_buffers[li].append(k_slice)  # [H_kv, valid_len, D]
+        if S_total == 0:
+            raise RuntimeError("No valid tokens assembled from chunks_pos")
 
-        if H_kv is None or D is None:
-            raise RuntimeError("Unable to infer H_kv/D from keys; no valid chunks?")
+        # Keys were fetched only once from the last chunk: retained-state [1,H_kv,ctx_len,D]
+        keys_per_layer = chunks_keys[0]
+        for li in range(L):
+            k = keys_per_layer[li]
+            if k is None:
+                raise RuntimeError(f"Missing retained-state keys for layer {li}")
+            if H_kv is None or D is None:
+                H_kv = int(k.shape[1])
+                D = int(k.shape[3])
+            # slice retained-state to global valid length, drop batch dim -> [H_kv, S_total, D]
+            k_slice = k[0, :, :S_total, :].astype(np.float16, copy=False)
+            per_layer_buffers[li].append(k_slice)
 
-        # concatenate per-layer lists along token axis
+        # concatenate per-layer lists along token axis (here each has single slice already)
         K_global: List[np.ndarray] = []
         for li in range(L):
             if len(per_layer_buffers[li]) == 0:
                 raise RuntimeError(f"No key buffers for layer {li}")
-            # [H_kv, S_total, D]
             K_concat = np.concatenate(per_layer_buffers[li], axis=1).astype(np.float16, copy=False)
             K_global.append(K_concat)
 
