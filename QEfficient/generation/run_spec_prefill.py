@@ -51,6 +51,19 @@ def main() -> None:
         choices=["all", "last4", "last1"],
         help="Which layers to use for host scoring aggregation."
     )
+    # --- simple policy gates ---
+    parser.add_argument(
+        "--min-spec-len",
+        type=int,
+        default=4096,
+        help="Skip speculative prefill when prompt length S < this value (default: 4096).",
+    )
+    parser.add_argument(
+        "--max-keep-for-spec",
+        type=float,
+        default=0.80,
+        help="Skip speculative prefill when keep percentage is too high (default: 0.80 == keep >80%).",
+    )
     # Optional: print and/or save pruned-path base model output (for verification)
     parser.add_argument(
         "--print-pruned-output",
@@ -126,6 +139,30 @@ def main() -> None:
         chunk=(not args.no_chunk),
         chunk_size=int(args.chunk_size),
     )
+    # --- compute prompt length S once for gating ---
+    enc_for_len = tokenizer(prompt_text, return_tensors="np")
+    S = int(enc_for_len["input_ids"].shape[1])
+    p = float(args.keep_percentage)
+    length_gate = (S < int(args.min_spec_len))
+    high_keep_gate = (p > float(args.max_keep_for_spec))
+
+    if length_gate or high_keep_gate:
+        reason = "short_prompt" if length_gate else "high_keep"
+        print(f"[gate] SKIP SpecPrefill (reason={reason})  S={S}  min_spec_len={args.min_spec_len}  keep={p:.2f}  max_keep_for_spec={args.max_keep_for_spec:.2f}")
+        # Baseline only (faithful TTFT for comparison)
+        t0 = time.time()
+        out_base_full, pos_full, _ = base.run_prefill(
+            [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+        )
+        ttft_base_full_s = time.time() - t0
+        print("\n[TTFT]")
+        print(f" S={S} kept={S} (no pruning)")
+        print(" base_full={:.1f} ms | spec_device+host=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
+        # No speculative output in this branch
+        return
+    else:
+        print(f"[gate] RUN SpecPrefill  S={S}  keep={p:.2f}  L_sel={args.layers_for_scoring}")
+
     ret = spec.prune_and_base_prefill(
         base_engine=base,
         prompt=prompt_text,
