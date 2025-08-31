@@ -297,8 +297,9 @@ class SpecPrefillEngine:
     def _assemble_global_keys(
         self,
         chunks_keys: List[List[np.ndarray]],   # len(chunks) list of per-layer key arrays [1,H_kv,S_chunk,D] FP16
-        chunks_pos:  List[np.ndarray],         # len(chunks) list of position_ids [1,S_chunk] int64
-    ) -> Tuple[List[np.ndarray], np.ndarray, int, int, int]:
+        chunks_pos: List[np.ndarray],          # len(chunks) list of position_ids [1,S_chunk] int64
+        chunks_ids: List[np.ndarray],          # len(chunks) list of input_ids [1,S_chunk] int64 (exactly what was fed)
+    ) -> Tuple[List[np.ndarray], np.ndarray, np.ndarray, int, int, int]:
         """
         Concatenate per-chunk keys per layer along token axis (exclude pads) and build global pos_ids.
 
@@ -312,6 +313,7 @@ class SpecPrefillEngine:
         # collect per-layer lists of [H_kv, valid_len_i, D]
         per_layer_buffers: List[List[np.ndarray]] = [[] for _ in range(L)]
         pos_global_list: List[np.ndarray] = []
+        ids_global_list: List[np.ndarray] = []
 
         H_kv = None
         D = None
@@ -325,6 +327,9 @@ class SpecPrefillEngine:
             if valid_len == 0:
                 continue
             pos_global_list.append(p[mask_valid])
+            # append the exact input_ids used for this chunk's valid region
+            ids_chunk = chunks_ids[ci].reshape(-1).astype(np.int64)
+            ids_global_list.append(ids_chunk[:valid_len])
             S_total += valid_len
 
             for li in range(L):
@@ -352,7 +357,8 @@ class SpecPrefillEngine:
             K_global.append(K_concat)
 
         pos_global = np.concatenate(pos_global_list, axis=0).astype(np.int64, copy=False)  # [S_total]
-        return K_global, pos_global, S_total, H_kv, D
+        ids_global = np.concatenate(ids_global_list, axis=0).astype(np.int64, copy=False)  # [S_total]
+        return K_global, pos_global, ids_global, S_total, H_kv, D
 
     # ---------- NEW: global scoring respecting GQA and padding ----------
     def _score_global_importance(
@@ -651,7 +657,8 @@ class SpecPrefillEngine:
 
         # Collect containers
         chunks_keys: List[List[np.ndarray]] = []   # list per-chunk of per-layer key arrays
-        chunks_pos:  List[np.ndarray] = []         # list per-chunk pos_ids
+        chunks_pos: List[np.ndarray] = []          # list per-chunk pos_ids
+        chunks_ids: List[np.ndarray] = []          # list per-chunk input_ids slices
         outputs_last = None
 
         for i in range(num_chunks):
@@ -671,6 +678,8 @@ class SpecPrefillEngine:
                 idx += 1
             chunks_keys.append(per_layer_keys)
             chunks_pos.append(chunk_inputs["position_ids"].copy())
+            # store exact input_ids fed to device for this chunk
+            chunks_ids.append(chunk_inputs["input_ids"].copy())
 
         if outputs_last is None:
             raise RuntimeError("No outputs from prefill; empty prompt?")
@@ -683,8 +692,8 @@ class SpecPrefillEngine:
             Q_final = Q_final[:, 0, :, :]  # squeeze batch if needed
 
         # 3) Assemble global keys per layer & global pos ids
-        K_global, pos_global, S_total, H_kv, D = self._assemble_global_keys(
-            chunks_keys, chunks_pos
+        K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
+            chunks_keys, chunks_pos, chunks_ids
         )
 
         # 4) Score global importance respecting GQA; aggregate heads/layers; optional smoothing
@@ -706,13 +715,13 @@ class SpecPrefillEngine:
 
         return {
             "importance": importance,  # [S_total]
-            "keep_idx": keep_idx,  # sorted, includes S_total-1
+            "keep_idx": keep_idx,      # sorted, includes S_total-1
             "S": S_total,
-            "pos_global": pos_global,  # <-- original absolute positions
             "shapes": {
                 "prefill_queries": tuple(Q_final.shape),
                 "first_key": tuple(K_global[0].shape),
             },
+            "ids_global": ids_global,  # [S_total] int64 (exact device-fed tokens)
         }
 
 
@@ -743,36 +752,27 @@ class SpecPrefillEngine:
         ttft_spec_only_s = t_spec_end - t_spec_start
         keep_idx = res["keep_idx"]
         S = res["S"]
-        pos_global = res.get("pos_global", None)
+        ids_global = res.get("ids_global", None)
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             imp = res["importance"]
             assert imp.shape[0] == S, f"importance len {imp.shape[0]} != S {S}"
-            if keep_idx.size > 0:
-                assert keep_idx.min() >= 0, "negative keep index"
-                assert keep_idx.max() < S, f"keep_idx contains out-of-range indices: {keep_idx.max()} >= {S}"
-                assert keep_idx[-1] == S-1, f"must keep last token: got keep_idx[-1]={keep_idx[-1]} vs S-1={S-1}"
-        # Build pruned input_ids and **original** position_ids
-        enc = self.tokenizer(prompt, return_tensors="np")
-        final_ids = enc["input_ids"][:, keep_idx].astype(np.int64)
-        if pos_global is None:
-            final_pos = keep_idx.reshape(1, -1).astype(np.int64)
-        else:
-            final_pos = pos_global[keep_idx].reshape(1, -1).astype(np.int64)
+            assert keep_idx.size > 0 and keep_idx[-1] == S - 1, "must keep last real token"
+            assert keep_idx.min() >= 0 and keep_idx.max() < S, "keep_idx out of range"
+            assert ids_global is not None and ids_global.shape[0] == S, "ids_global missing/mismatch"
+        # Build pruned inputs from the *exact* device-fed ids (no re-tokenization)
+        if ids_global is None:
+            raise RuntimeError("ids_global not present in scoring result")
+        final_ids = ids_global[keep_idx].reshape(1, -1).astype(np.int64, copy=False)
+        final_pos = keep_idx.reshape(1, -1).astype(np.int64, copy=False)
 
-        # ---- debug: print pruned tokens that will be fed to the base (IDs & tokens) ----
+        # ---- debug: print pruned tokens using device-fed ids ----
         try:
             if os.getenv("QEFF_SPEC_DEBUG", ""):
                 ids_list = final_ids[0].tolist()
                 tok_list = self.tokenizer.convert_ids_to_tokens(ids_list)
-                k_preview = (
-                    keep_idx[:32].tolist()
-                    if hasattr(keep_idx, "tolist")
-                    else list(keep_idx)[:32]
-                )
+                k_preview = keep_idx[:32].tolist()
                 t_preview = tok_list[:32]
-                print(
-                    f"[spec:pruned] kept={len(ids_list)}/{S} keep_idx[:32]={k_preview}"
-                )
+                print(f"[spec:pruned] kept={len(ids_list)}/{S} keep_idx[:32]={k_preview}")
                 print(f"[spec:pruned] tokens[:32]={t_preview}")
                 txt_preview = self.tokenizer.decode(ids_list, skip_special_tokens=True)
                 print(f"[spec:pruned] text_preview={txt_preview[:120]!r}")
