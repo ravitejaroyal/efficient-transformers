@@ -182,6 +182,9 @@ class SpecPrefillEngine:
         self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None
     ):
         """Runs prefill for a given prompt and generation length."""
+        # ---- one-time wall clock for the whole spec prefill ----
+        t_prefill_start = time.perf_counter()
+
         inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
         position_ids = inputs["attention_mask"].sum(1, keepdims=True)
         padded_len = inputs["input_ids"].shape[1]
@@ -195,6 +198,9 @@ class SpecPrefillEngine:
             (prefill_logit_bs, 1, self._vocab_size), dtype=np.float32
         )
         self._session.set_buffers({"logits": logits_out_placeholder})
+
+        # NOTE: we will only bind a logits placeholder on the FINAL chunk (if we print final token).
+        # Per-chunk gating of outputs is handled inside the loop.
 
         inputs = self.tokenizer(
             prompt, return_tensors="np", padding="max_length", max_length=padded_len
@@ -254,15 +260,14 @@ class SpecPrefillEngine:
             except Exception:
                 pass
 
-        import os
-        import time
-
         # Collect per-chunk tensors for host scoring
         chunks_keys: List[List[np.ndarray]] = []
         chunks_pos: List[np.ndarray] = []
         chunks_ids: List[np.ndarray] = []
         outputs_last = None
-        per_chunk: List[Tuple[int, float, float, int]] = []
+        per_chunk_times: List[Tuple[int, float]] = []
+
+        want_logits = bool(os.getenv("QEFF_SPEC_DEBUG", ""))
 
         for i in range(num_chunks):
             chunk_inputs = inputs.copy()
@@ -272,24 +277,37 @@ class SpecPrefillEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
+
+            # ---- per-chunk output gating: only the LAST chunk produces 'prefill_queries'
+            gate_names = ["prefill_queries"]
+            if want_logits:
+                gate_names.append("logits")
+            if i != num_chunks - 1:
+                try:
+                    self._session.skip_buffers(gate_names)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._session.enable_outputs(["prefill_queries"])
+                except Exception:
+                    pass
+                if want_logits:
+                    logits_out_placeholder = np.zeros(
+                        (prefill_logit_bs, 1, self._vocab_size), dtype=np.float32
+                    )
+                    self._session.set_buffers({"logits": logits_out_placeholder})
+
             # Re-enable past_key.* only for the final chunk to fetch the full retained state once
             if i == num_chunks - 1 and keep_layers:
                 self._session.enable_outputs(
                     [f"past_key.{li}_RetainedState" for li in keep_layers]
                 )
+
             t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
-            t1 = time.perf_counter()
-            mb = 0.0
-            n_out = 0
-            try:
-                for arr in outputs.values():
-                    if isinstance(arr, np.ndarray):
-                        mb += (arr.size * arr.itemsize) / 1e6
-                        n_out += 1
-            except Exception:
-                pass
-            per_chunk.append((i, t1 - t0, mb, n_out))
+            dt = time.perf_counter() - t0
+            per_chunk_times.append((i, dt))
             outputs_last = outputs
 
             # record positions and ids for *every* chunk
@@ -310,11 +328,12 @@ class SpecPrefillEngine:
         if outputs_last is None:
             raise RuntimeError("No outputs from prefill; empty prompt?")
 
-        last_logits = outputs_last["logits"][0, -1]
-        token_id = int(last_logits.argmax())
-        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-        if os.getenv("QEFF_SPEC_DEBUG", ""):
-            print(f"[spec:prefill] final token: {token_text!r}", flush=True)
+        if want_logits and "logits" in outputs_last:
+            last_logits = outputs_last["logits"][0, -1]
+            token_id = int(last_logits.argmax())
+            token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                print(f"[spec:prefill] final token: {token_text!r}", flush=True)
 
         # Cache Q_final (prefill_queries from last chunk)
         if "prefill_queries" not in outputs_last:
@@ -342,20 +361,15 @@ class SpecPrefillEngine:
             "Q_final": Q_final,
         }
 
+        t_prefill_end = time.perf_counter()
+        total_t = t_prefill_end - t_prefill_start
+        avg_t = total_t / max(1, num_chunks)
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             try:
-                total_t = sum(dt for _, dt, _, _ in per_chunk)
-                total_mb = sum(mb for _, _, mb, _ in per_chunk)
-                worst = sorted(per_chunk, key=lambda x: x[1], reverse=True)[:3]
+                worst = sorted(per_chunk_times, key=lambda x: x[1], reverse=True)[:3]
+                worst_fmt = ", ".join([f"({ci}, {dt:.3f}s)" for ci, dt in worst])
                 print(
-                    "[spec:prefill] chunks=%d  total=%.3fs  avg=%.3fs  out=%.1fMB  worst=%s"
-                    % (
-                        len(per_chunk),
-                        total_t,
-                        total_t / max(1, len(per_chunk)),
-                        total_mb,
-                        [(i, round(dt, 3), round(mb, 1)) for (i, dt, mb, _) in worst],
-                    ),
+                    f"[spec:prefill] chunks={num_chunks}  total={total_t:.3f}s  avg={avg_t:.3f}s  worst=[{worst_fmt}]",
                     flush=True,
                 )
             except Exception:
@@ -768,9 +782,6 @@ class SpecPrefillEngine:
         if keep_cfg.strategy != "percentage":
             raise NotImplementedError(f"keep strategy {keep_cfg.strategy!r}")
 
-        import os
-        import time
-
         t0 = time.perf_counter()
         # Ensure we have a first-pass cache. If absent, run prefill once to populate.
         if self._prefill_cache is None:
@@ -804,9 +815,24 @@ class SpecPrefillEngine:
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
 
-        # Always-on sanity checks (not gated)
+        # ---- ALWAYS-ON invariants & shape/gqa print ----
+        try:
+            L_q, H_q, D_q = tuple(Q_final.shape)
+            H_kv_0, S0, D0 = tuple(K_global[0].shape)
+            group_size = H_q // max(1, H_kv_0)
+            print(
+                f"[spec:invariants] S_total={S_total}  Q_final={Q_final.shape}  "
+                f"K0={K_global[0].shape}  H={H_q} H_kv={H_kv_0} group={group_size}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+        # Hard sanity checks (not gated)
         if importance.shape[0] != S_total:
             raise AssertionError(f"importance len {importance.shape[0]} != S {S_total}")
+        if ids_global.shape[0] != S_total:
+            raise AssertionError(f"ids_global len {ids_global.shape[0]} != S {S_total}")
 
         keep_idx = self._select_global_topk(importance, keep_cfg.percentage, force_last=True)
         keep_idx = np.union1d(
