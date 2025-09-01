@@ -282,6 +282,9 @@ class QEFFBaseModel(ABC):
             return self.qpc_path
 
         command = constants.COMPILER + [f"-m={onnx_path}"]
+        # Always expose retained-state for host-side scoring (single or multi-device)
+        if "-retained-state" not in command:
+            command.append("-retained-state")
 
         if mdp_ts_json_path := compiler_options.pop("mdp_load_partition_config", None):
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
@@ -337,6 +340,8 @@ class QEFFBaseModel(ABC):
             mdp_ts_json_path = compile_dir / f"mdp_ts_{mdp_ts_num_devices}.json"
             create_json(str(mdp_ts_json_path), mdp_ts_json)
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
+            # ensure the compiler knows how many slices/devices we intend to use
+            command.append(f"-mos={int(mdp_ts_num_devices)}")
 
         # Write specializations.json file
         if specializations is not None:
@@ -347,11 +352,34 @@ class QEFFBaseModel(ABC):
             create_json(str(specializations_json), specializations_data)
             command.append(f"-network-specialization-config={specializations_json}")
 
-        # Write custom_io.yaml file
-        if custom_io is not None:
+        # Write (or synthesize) custom_io.yaml so retained-state isn't dropped in MDP/TS
+        custom_map = dict(custom_io) if custom_io is not None else {}
+        if not custom_map:
+            # Try to open ONNX and discover retained-state outputs
+            try:
+                import onnx, re
+                model_onnx = onnx.load(str(onnx_path), load_external_data=False)
+                out_names = [o.name for o in model_onnx.graph.output]
+                # collect retained-state outputs from ONNX (past_key/past_value)
+                for n in out_names:
+                    if re.search(r"past_key\.\d+.*_RetainedState", n):
+                        custom_map.setdefault(n, "float16")
+                    if re.search(r"past_value\.\d+.*_RetainedState", n):
+                        custom_map.setdefault(n, "float16")
+                # research heads / standard
+                if "prefill_queries" in out_names:
+                    custom_map.setdefault("prefill_queries", "float32")
+                if "logits" in out_names:
+                    custom_map.setdefault("logits", "float32")
+            except Exception:
+                # If ONNX parse fails, still ensure at least research/logits present
+                custom_map.setdefault("prefill_queries", "float32")
+                custom_map.setdefault("logits", "float32")
+
+        if custom_map:
             custom_io_yaml = compile_dir / "custom_io.yaml"
             with open(custom_io_yaml, "w") as fp:
-                for io_name, dtype in custom_io.items():
+                for io_name, dtype in custom_map.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
