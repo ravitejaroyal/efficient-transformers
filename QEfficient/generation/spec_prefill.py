@@ -4,6 +4,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
+import re
 
 import numpy as np
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -249,35 +250,58 @@ class SpecPrefillEngine:
                 inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(
                     self.batch_size, 1
                 )
-        # Determine which past_key.*_RetainedState to keep and skip the rest (default: all)
+        # Determine which past_key.*_RetainedState outputs exist and robustly extract layer indices,
+        # even when names are tagged (e.g., "mdp0:past_key.0_RetainedState").
         pk_names = [
-            n
-            for n in self._session.output_names
-            if n.startswith("past_key.") and n.endswith("_RetainedState")
+            n for n in self._session.output_names
+            if ("past_key." in n and "_RetainedState" in n)
         ]
-        present_layers = sorted(
-            {int(n.split(".")[1].split("_")[0]) for n in pk_names}
-        )
-        keep_layers: List[int] = []
-        if present_layers:
-            L = max(present_layers) + 1
-            if self._layers_sel == "last1":
-                keep_layers = [L - 1]
-            elif self._layers_sel == "last4":
-                keep_layers = list(range(max(L - 4, 0), L))
-            else:
-                keep_layers = list(range(L))
-            # Skip ALL kept layers initially; we'll re-enable them only for the *last* chunk
-            to_skip = [f"past_key.{i}_RetainedState" for i in keep_layers]
-            if to_skip:
-                self._session.skip_buffers(to_skip)
-        self._kept_layers = keep_layers
+        layer_pairs: List[Tuple[int, str]] = []
+        for n in pk_names:
+            m = re.search(r"past_key\.(\d+).*_RetainedState", n)
+            if m:
+                layer_pairs.append((int(m.group(1)), n))
+
+        if not layer_pairs:
+            raise RuntimeError(
+                "[spec] No past_key.*_RetainedState outputs found in QPC; "
+                "dump output_names and verify exporter/compile."
+            )
+
+        present_layers = sorted({li for (li, _) in layer_pairs})
+        if not present_layers:
+            raise RuntimeError("[spec] present_layers empty after parsing retained-state outputs")
+
+        # Decide which indices to keep per --layers-for-scoring (faithful default: all)
+        L = max(present_layers) + 1
+        if self._layers_sel == "last1":
+            keep_set = {max(present_layers)}
+        elif self._layers_sel == "last4":
+            keep_set = set(range(max(L - 4, 0), L))
+        else:
+            keep_set = set(present_layers)
+
+        # Build actual binding-name lists to skip/enable
+        keep_bindings = [name for (li, name) in layer_pairs if li in keep_set]
+        skip_bindings = [name for (li, name) in layer_pairs if li in present_layers and li not in keep_set]
+
+        # Skip now; enable only on the *last* chunk
+        if skip_bindings:
+            self._session.skip_buffers(skip_bindings)
+
+        self._kept_layers = sorted(list(keep_set))
+        if not self._kept_layers:
+            raise RuntimeError("[spec] kept_layers empty; cannot harvest retained-state keys. "
+                               "Check binding names and layer discovery.")
+
+        # Stash for use inside the loop when enabling on the last chunk
+        _kept_retained_bindings = keep_bindings  # names to enable on the final chunk
+
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             try:
-                print(
-                    f"[spec] layers_sel={self._layers_sel}  kept_layers={self._kept_layers}",
-                    flush=True,
-                )
+                sample = ", ".join([n for (_, n) in layer_pairs[:3]])
+                print(f"[spec] found past_key bindings ({len(layer_pairs)}): {sample}", flush=True)
+                print(f"[spec] layers_sel={self._layers_sel} kept_layers={self._kept_layers}", flush=True)
             except Exception:
                 pass
 
@@ -301,10 +325,11 @@ class SpecPrefillEngine:
             # NOTE: 'prefill_queries' is bound every chunk but only needed on the last one.
 
             # Re-enable past_key.* only for the final chunk to fetch the full retained state once
-            if i == num_chunks - 1 and keep_layers:
-                self._session.enable_outputs(
-                    [f"past_key.{li}_RetainedState" for li in keep_layers]
-                )
+            if i == num_chunks - 1:
+                try:
+                    self._session.enable_outputs(_kept_retained_bindings)
+                except Exception as e:
+                    raise RuntimeError(f"[spec] failed to re-enable retained-state outputs on last chunk: {e}")
 
             t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
