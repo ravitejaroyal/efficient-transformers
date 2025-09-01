@@ -250,60 +250,58 @@ class SpecPrefillEngine:
                 inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(
                     self.batch_size, 1
                 )
-        # Determine which past_key.*_RetainedState outputs exist and robustly extract layer indices,
-        # even when names are tagged (e.g., "mdp0:past_key.0_RetainedState").
-        pk_names = [
-            n for n in self._session.output_names
-            if ("past_key." in n and "_RetainedState" in n)
-        ]
+        # Determine which retained-state key bindings exist (MDP/TS tolerant) and which to keep
+        # Accept names like: 'past_key.0_RetainedState', 'mdp0:past_key.0_RetainedState', 'ts0/past_key.0_RetainedState', etc.
+        pk_names = [n for n in self._session.output_names if ("past_key." in n and "_RetainedState" in n)]
         layer_pairs: List[Tuple[int, str]] = []
         for n in pk_names:
             m = re.search(r"past_key\.(\d+).*_RetainedState", n)
             if m:
                 layer_pairs.append((int(m.group(1)), n))
 
-        if not layer_pairs:
-            raise RuntimeError(
-                "[spec] No past_key.*_RetainedState outputs found in QPC; "
-                "dump output_names and verify exporter/compile."
-            )
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                sample = ", ".join([name for (_, name) in layer_pairs[:3]])
+                print(f"[spec] found past_key bindings ({len(layer_pairs)}): {sample}", flush=True)
+            except Exception:
+                pass
 
         present_layers = sorted({li for (li, _) in layer_pairs})
         if not present_layers:
-            raise RuntimeError("[spec] present_layers empty after parsing retained-state outputs")
+            # No retained-state keys visible: print outputs list for triage and stop
+            if os.getenv("QEFF_SPEC_DEBUG",""):
+                print("[spec] WARNING: no past_key.*_RetainedState outputs discovered; dumping a few output_names:",
+                      [n for n in self._session.output_names if "past_key" in n][:10],
+                      flush=True)
+            raise RuntimeError("[spec] No past_key.*_RetainedState outputs found in QPC; cannot harvest keys.")
 
-        # Decide which indices to keep per --layers-for-scoring (faithful default: all)
-        L = max(present_layers) + 1
+        # Decide which layer indices to keep
         if self._layers_sel == "last1":
             keep_set = {max(present_layers)}
         elif self._layers_sel == "last4":
-            keep_set = set(range(max(L - 4, 0), L))
+            last = max(present_layers)
+            keep_set = set(range(max(last - 3, min(present_layers)), last + 1))
         else:
-            keep_set = set(present_layers)
+            keep_set = set(present_layers)  # 'all' is faithful default
 
-        # Build actual binding-name lists to skip/enable
+        # Build binding-name lists for skip/enable
         keep_bindings = [name for (li, name) in layer_pairs if li in keep_set]
-        skip_bindings = [name for (li, name) in layer_pairs if li in present_layers and li not in keep_set]
+        skip_bindings = [name for (li, name) in layer_pairs if li not in keep_set]
 
-        # Skip now; enable only on the *last* chunk
+        # Skip now; we will re-enable on the final chunk to fetch retained state once
         if skip_bindings:
             self._session.skip_buffers(skip_bindings)
+        # Also skip the kept bindings initially (we only want them ON for the final chunk)
+        if keep_bindings:
+            self._session.skip_buffers(keep_bindings)
 
         self._kept_layers = sorted(list(keep_set))
-        if not self._kept_layers:
-            raise RuntimeError("[spec] kept_layers empty; cannot harvest retained-state keys. "
-                               "Check binding names and layer discovery.")
-
-        # Stash for use inside the loop when enabling on the last chunk
-        _kept_retained_bindings = keep_bindings  # names to enable on the final chunk
-
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             try:
-                sample = ", ".join([n for (_, n) in layer_pairs[:3]])
-                print(f"[spec] found past_key bindings ({len(layer_pairs)}): {sample}", flush=True)
                 print(f"[spec] layers_sel={self._layers_sel} kept_layers={self._kept_layers}", flush=True)
             except Exception:
                 pass
+
 
         # Collect per-chunk tensors for host scoring
         chunks_keys: List[List[np.ndarray]] = []
@@ -326,10 +324,11 @@ class SpecPrefillEngine:
 
             # Re-enable past_key.* only for the final chunk to fetch the full retained state once
             if i == num_chunks - 1:
+                # Use binding names discovered above (MDP/TS tolerant)
                 try:
-                    self._session.enable_outputs(_kept_retained_bindings)
+                    self._session.enable_outputs(keep_bindings)
                 except Exception as e:
-                    raise RuntimeError(f"[spec] failed to re-enable retained-state outputs on last chunk: {e}")
+                    raise RuntimeError(f"[spec] enable_outputs failed for retained-state keys: {e}")
 
             t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
@@ -369,6 +368,9 @@ class SpecPrefillEngine:
         if Q_final.ndim == 4 and Q_final.shape[1] == 1:
             # squeeze batch if present
             Q_final = Q_final[:, 0, :, :]
+
+        if not self._kept_layers:
+            raise RuntimeError("[spec] kept_layers is empty; cannot harvest retained-state keys.")
 
         # Harvest *retained-state* keys *once* from the final chunk (full ctx_len per layer), for kept layers
         per_layer_keys_last: List[np.ndarray] = []
