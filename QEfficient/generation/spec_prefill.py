@@ -250,6 +250,26 @@ class SpecPrefillEngine:
                 inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(
                     self.batch_size, 1
                 )
+
+        # ---- Debug: dump available outputs/bindings so we can see retained-state names (MDP/TS safe) ----
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                outs = list(getattr(self._session, "output_names", []))
+                print(
+                    f"[spec:debug] output_names({len(outs)}): {outs[:20]}{' …' if len(outs)>20 else ''}",
+                    flush=True,
+                )
+                try:
+                    bind_names = [b.name for b in getattr(self._session, "bindings", [])]
+                    print(
+                        f"[spec:debug] bindings({len(bind_names)}): {bind_names[:20]}{' …' if len(bind_names)>20 else ''}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         # Determine which retained-state key bindings exist (MDP/TS tolerant) and which to keep
         # Accept names like: 'past_key.0_RetainedState', 'mdp0:past_key.0_RetainedState', 'ts0/past_key.0_RetainedState', etc.
         pk_names = [n for n in self._session.output_names if ("past_key." in n and "_RetainedState" in n)]
