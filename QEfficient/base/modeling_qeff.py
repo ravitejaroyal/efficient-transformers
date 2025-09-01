@@ -282,7 +282,7 @@ class QEFFBaseModel(ABC):
             return self.qpc_path
 
         command = constants.COMPILER + [f"-m={onnx_path}"]
-        # Always expose retained-state for host-side scoring (single or multi-device)
+        # Always expose retained-state for KV harvesting
         if "-retained-state" not in command:
             command.append("-retained-state")
 
@@ -340,8 +340,6 @@ class QEFFBaseModel(ABC):
             mdp_ts_json_path = compile_dir / f"mdp_ts_{mdp_ts_num_devices}.json"
             create_json(str(mdp_ts_json_path), mdp_ts_json)
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
-            # ensure the compiler knows how many slices/devices we intend to use
-            command.append(f"-mos={int(mdp_ts_num_devices)}")
 
         # Write specializations.json file
         if specializations is not None:
@@ -352,27 +350,35 @@ class QEFFBaseModel(ABC):
             create_json(str(specializations_json), specializations_data)
             command.append(f"-network-specialization-config={specializations_json}")
 
-        # Write (or synthesize) custom_io.yaml so retained-state isn't dropped in MDP/TS
+        # --- Ensure selected I/O keeps retained-state + research heads ---
+        # If caller didn't provide custom_io, synthesize one from ONNX outputs so the compiler
+        # doesn't elide retained-state in MDP/TS builds.
         custom_map = dict(custom_io) if custom_io is not None else {}
         if not custom_map:
-            # Try to open ONNX and discover retained-state outputs
             try:
                 import onnx, re
                 model_onnx = onnx.load(str(onnx_path), load_external_data=False)
                 out_names = [o.name for o in model_onnx.graph.output]
-                # collect retained-state outputs from ONNX (past_key/past_value)
-                for n in out_names:
-                    if re.search(r"past_key\.\d+.*_RetainedState", n):
-                        custom_map.setdefault(n, "float16")
-                    if re.search(r"past_value\.\d+.*_RetainedState", n):
-                        custom_map.setdefault(n, "float16")
-                # research heads / standard
+                # Collect all past_key/past_value retained-state outputs
+                rk = [n for n in out_names if re.search(r"past_key\.\d+.*_RetainedState", n)]
+                rv = [n for n in out_names if re.search(r"past_value\.\d+.*_RetainedState", n)]
+                if not rk and not rv:
+                    # If the ONNX itself lacks retained-state outputs, fail fast with context.
+                    raise RuntimeError(
+                        "[compile] ONNX has no retained-state outputs in graph.output; "
+                        "cannot force keys into selected I/O. Re-check exporter/output_names."
+                    )
+                for n in rk:
+                    custom_map.setdefault(n, "float16")
+                for n in rv:
+                    custom_map.setdefault(n, "float16")
                 if "prefill_queries" in out_names:
                     custom_map.setdefault("prefill_queries", "float32")
                 if "logits" in out_names:
                     custom_map.setdefault("logits", "float32")
-            except Exception:
-                # If ONNX parse fails, still ensure at least research/logits present
+            except Exception as e:
+                # Still guarantee research/logits appear, but surface the error for visibility
+                logger.warning(f"[compile] custom_io synthesize warning: {e}")
                 custom_map.setdefault("prefill_queries", "float32")
                 custom_map.setdefault("logits", "float32")
 
@@ -382,6 +388,9 @@ class QEFFBaseModel(ABC):
                 for io_name, dtype in custom_map.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
             command.append(f"-custom-IO-list-file={custom_io_yaml}")
+            logger.info(
+                f"[compile] custom_io.yaml wrote {len(custom_map)} I/O; retained-state preserved in selected set."
+            )
 
         command.append(f"-aic-binary-dir={qpc_path}")
         logger.info(f"Running compiler: {' '.join(command)}")
