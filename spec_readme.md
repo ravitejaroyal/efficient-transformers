@@ -1,3 +1,28 @@
+# Speculative Prefill Algorithm
+
+1. **Step-by-Step Attention Calculation**
+   - **Scaled Dot-Product (Query · Key / √2):** Now we have the full logits tensor `[L=2, H=2, steps=3, S=6]`.
+   - **Softmax Over Sequence:** Each row above is a probability distribution over the 6 context tokens for a given layer/head and step. Example: `P[L0, H0, step 0] = [0.0924, 0.7706, 0.0225, 0.0111, 0.0111, 0.0924]`, sum = 1.0000.
+   - **Average Pooling (Smoothing):** Each of these is a length-6 vector of smoothed attention probabilities for the 6 positions. Example: `Smooth[L0, H0, step 0] = [0.2877, 0.2952, 0.2681, 0.0149, 0.0382, 0.0345]`.
+
+2. **Aggregated Attention Score (Max over Heads/Layers, then Mean over Steps)**
+   - **Max over (L, H):** Maximum attention probability a token got from any head in that step. Example: `Max over (L,H) at Step 0: [0.2974, 0.2974, 0.2681, 0.2857, 0.2136, 0.1266]`.
+   - **Mean over Steps:** These are the final aggregated importance scores for tokens 0,1,2,3,4,5 respectively. Example: `Position 1: step0 0.2974, step1 0.2952, step2 0.3137. Mean = (0.2974 + 0.2952 + 0.3137) / 3 = 0.3021` and `Token importance = [0.2321, 0.3021, 0.2894, 0.2552, 0.2060, 0.1163]`.
+
+3. **Chunk Selection + Always-Keep Rule**
+   - **Chunking:** We partition the 6 tokens into contiguous chunks of size 2.
+   - **Top-K Selection:** We keep the top `K = ceil(3 × 0.5) = 2` chunks (50% of 3 chunks).
+   - **Gather Kept Token Indices and Always-Keep-Last Rule**
+
+4. **Build the Final Input for the Base Model (Token IDs and Position IDs)**
+   - **Final Token IDs**
+   - **Position IDs (Restoration of Positions)**
+
+   **Why restoration of position ids:** When we prune tokens in speculative prefill, it’s tempting to renumber the survivors from 0 up—after all, fewer tokens feel like a fresh, shorter sequence. But LLaMA 3’s RoPE (rotary) attention is built around absolute token positions.  
+   Rotating the query and key vectors by position-dependent sine/cosine patterns (RoPE) injects the notion of “distance” directly into the dot-product attention: when you compute `Q·Kᵀ` after rotation, the phase difference between any two vectors encodes their relative index gap.  
+   This matters because plain attention only compares content, ignoring where tokens sit in the sequence; by weaving position rotations into Q and K, the model’s attention scores naturally factor in how far apart tokens are, letting it learn and apply patterns that depend on token order and spacing.  
+   Rotary attention uses those absolute positions to measure exactly how far apart tokens are and encodes that “distance” as a subtle rotation in the model’s internal math.
+
 # Implementation vs. algorithm (look‑ahead = 0)
 
 - Skip unused past-state I/O – the speculator session drops all `past_*` inputs and `past_value.*` outputs so that only `prefill_queries` and retained keys are fetched later
