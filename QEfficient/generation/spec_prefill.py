@@ -43,6 +43,9 @@ class SpecPrefillEngine:
         self._ctx_len = ctx_len
         self._write_io_dir = write_io_dir
         self.is_tlm = is_tlm
+        # optional look-ahead anchors (default: disabled)
+        self._look_ahead = 0
+        self._last_outputs = None
 
         # Load QPC
         self._session = QAICInferenceSession(
@@ -375,6 +378,9 @@ class SpecPrefillEngine:
             if os.getenv("QEFF_SPEC_DEBUG", ""):
                 print(f"[spec:prefill] final token: {token_text!r}", flush=True)
 
+        # Cache last outputs for possible look-ahead
+        self._last_outputs = outputs_last
+
         # Cache Q_final (prefill_queries from last chunk)
         if "prefill_queries" not in outputs_last:
             raise KeyError("prefill_queries not found in last prefill outputs")
@@ -625,8 +631,8 @@ class SpecPrefillEngine:
             layer_scores[ell, :] = a_heads
             ell += 1
 
-        # mean across layers
-        importance = np.mean(layer_scores, axis=0, dtype=np.float32)  # [S]
+        # paper §3.2.2: max over layers (after head aggregation)
+        importance = np.max(layer_scores, axis=0)  # [S]
 
         # optional smoothing (simple moving average; length-preserving)
         if smooth_window is not None and smooth_window > 1:
@@ -672,6 +678,40 @@ class SpecPrefillEngine:
             idx = np.unique(np.concatenate([idx, np.array([S-1], dtype=idx.dtype)]))
         return idx
 
+    def _select_blocks_topk(
+        self,
+        importance: np.ndarray,    # [S] float32
+        keep_fraction: float,
+        chunk_size: int,
+        *,
+        force_last: bool = True,
+    ) -> np.ndarray:
+        import math
+        S = int(importance.shape[0])
+        if chunk_size <= 0:
+            return self._select_global_topk(importance, keep_fraction, force_last=force_last)
+
+        num_blocks = (S + chunk_size - 1) // chunk_size
+        block_scores = np.empty((num_blocks,), dtype=np.float32)
+        for b in range(num_blocks):
+            s = b * chunk_size
+            e = min(S, s + chunk_size)
+            block_scores[b] = float(np.mean(importance[s:e]))
+
+        keep_blocks = max(1, int(math.ceil(keep_fraction * num_blocks)))
+        topb = np.argpartition(-block_scores, keep_blocks - 1)[:keep_blocks]
+        topb.sort()
+
+        kept = []
+        for b in topb.tolist():
+            s = b * chunk_size
+            e = min(S, s + chunk_size)
+            kept.append(np.arange(s, e, dtype=np.int64))
+        idx = np.unique(np.concatenate(kept))
+        if force_last and (S - 1) not in idx:
+            idx = np.unique(np.concatenate([idx, np.array([S - 1], dtype=np.int64)]))
+        return idx
+
     # ---- helper: get last token id+text from a prefill outputs dict ----
     @staticmethod
     def _next_token_from_outputs(outputs: Dict[str, Any], tokenizer) -> Tuple[Optional[int], Optional[str]]:
@@ -683,6 +723,71 @@ class SpecPrefillEngine:
         tok_id = int(logits.argmax(2)[0, 0])
         tok_text = tokenizer.decode([tok_id], skip_special_tokens=True)
         return tok_id, tok_text
+
+    def _collect_anchor_queries(self, N: int, S: int) -> List[np.ndarray]:
+        anchors = []
+        anchors.append(self._prefill_cache["Q_final"])  # [L,H,D]
+        if N <= 0:
+            return anchors[0:1]
+
+        if (
+            ("prefill_queries" not in self._session.binding_index_map)
+            or (not self._session.allowed_shapes)
+            or (len(self._session.allowed_shapes) < 2)
+        ):
+            return anchors[0:1]
+
+        idx = self._session.binding_index_map["prefill_queries"]
+        _, dec_dims = self._session.allowed_shapes[1][idx]
+        pq_decode = np.empty(tuple(dec_dims), dtype=np.float32)
+
+        next_pos = S
+        for _ in range(N):
+            last = self._last_outputs if hasattr(self, "_last_outputs") else None
+            if last is None or "logits" not in last:
+                break
+            next_token = int(np.argmax(last["logits"][0, -1, :]))
+            dec_inputs = {
+                "input_ids": np.array([[next_token]], dtype=np.int64),
+                "position_ids": np.array([[next_pos]], dtype=np.int64),
+            }
+            self._session.set_buffers({"prefill_queries": pq_decode})
+            out = self._session.run(dec_inputs)
+            self._last_outputs = out
+            if "prefill_queries" in out:
+                anchors.append(out["prefill_queries"].copy())
+            next_pos += 1
+
+        return anchors
+
+    def _score_importance_multi_anchor(
+        self,
+        K_global: List[np.ndarray],
+        Q_anchors: List[np.ndarray],
+        pos_global: np.ndarray,
+        *,
+        layers_sel: str,
+        agg_heads: str,
+        smooth_window: Optional[int],
+    ) -> np.ndarray:
+        acc = []
+        for Q_final in Q_anchors:
+            imp, _ = self._score_global_importance(
+                Q_final,
+                K_global,
+                pos_global,
+                layers_sel=layers_sel,
+                agg_heads=agg_heads,
+                smooth_window=None,
+            )
+            acc.append(imp.astype(np.float32, copy=False))
+        importance = np.mean(np.stack(acc, axis=0), axis=0, dtype=np.float32)
+        if smooth_window and smooth_window > 1:
+            w = max(1, min(int(smooth_window), importance.shape[0]))
+            if w > 1:
+                kernel = np.ones((w,), dtype=np.float32) / float(w)
+                importance = np.convolve(importance, kernel, mode="same").astype(np.float32)
+        return importance
 
     def _avg_pool1d_same(self, x: np.ndarray, kernel: int) -> np.ndarray:
         """
@@ -845,14 +950,16 @@ class SpecPrefillEngine:
         )
         t2 = time.perf_counter()
 
-        importance, diag = self._score_global_importance(
-            Q_final=Q_final.astype(np.float32, copy=False),
-            K_global=K_global,
-            pos_global=pos_global,
+        Q_anchors = self._collect_anchor_queries(getattr(self, "_look_ahead", 0), S_total)
+        importance = self._score_importance_multi_anchor(
+            K_global,
+            Q_anchors,
+            pos_global,
             layers_sel=layers_sel,
             agg_heads="max",
             smooth_window=pool_kernel_size if pool_kernel_size and pool_kernel_size > 1 else None,
         )
+        diag = {}
         t3 = time.perf_counter()
 
         if os.getenv("QEFF_SPEC_ASSERT", ""):
@@ -877,7 +984,17 @@ class SpecPrefillEngine:
         if ids_global.shape[0] != S_total:
             raise AssertionError(f"ids_global len {ids_global.shape[0]} != S {S_total}")
 
-        keep_idx = self._select_global_topk(importance, keep_cfg.percentage, force_last=True)
+        if keep_cfg and getattr(keep_cfg, "chunk", True):
+            keep_idx = self._select_blocks_topk(
+                importance,
+                keep_cfg.percentage,
+                keep_cfg.chunk_size,
+                force_last=True,
+            )
+        else:
+            keep_idx = self._select_global_topk(
+                importance, keep_cfg.percentage, force_last=True
+            )
         keep_idx = np.union1d(
             keep_idx.astype(np.int64, copy=False), np.array([S_total - 1], dtype=np.int64)
         )
@@ -927,6 +1044,7 @@ class SpecPrefillEngine:
         prefill_logit_bs: int = 1,
         layers_sel: str = "all",
         gen_len: Optional[int] = None,
+        look_ahead: int = 0,
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
@@ -934,6 +1052,7 @@ class SpecPrefillEngine:
         """
         # ---- TTFT(spec_only): spec prefill + score + select ----
         t_spec_start = time.perf_counter()
+        self._look_ahead = int(look_ahead)
         res = self.prefill_and_score(
             prompt,
             pool_kernel_size=pool_kernel_size,

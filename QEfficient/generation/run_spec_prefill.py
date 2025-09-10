@@ -46,6 +46,12 @@ def main() -> None:
         "--no-chunk", action="store_true", help="Disable chunked keep; use per-token percentage."
     )
     parser.add_argument(
+        "--look-ahead",
+        type=int,
+        default=0,
+        help="Number of decode anchors for look-ahead (default: 0).",
+    )
+    parser.add_argument(
         "--layers-for-scoring",
         default="all",
         choices=["all", "last4", "last1"],
@@ -171,6 +177,7 @@ def main() -> None:
         prefill_logit_bs=1,
         layers_sel=args.layers_for_scoring,
         gen_len=int(args.gen_len) if args.gen_len is not None else None,
+        look_ahead=int(args.look_ahead),
     )
 
     # --- Pretty, accurate TTFT breakdown ---
