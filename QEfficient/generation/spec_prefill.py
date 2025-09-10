@@ -883,6 +883,12 @@ class SpecPrefillEngine:
         )
         t4 = time.perf_counter()
 
+        # collect timing diagnostics for caller
+        t_run_prefill_s = t1 - t0
+        t_assemble_s = t2 - t1
+        t_score_s = t3 - t2
+        t_select_s = t4 - t3
+
         if os.getenv("QEFF_SPEC_DEBUG", ""):
             try:
                 print(
@@ -915,6 +921,11 @@ class SpecPrefillEngine:
                 "first_key": tuple(K_global[0].shape),
             },
             "ids_global": ids_global,  # [S_total] int64 (exact device-fed tokens)
+            # timing breakdown
+            "t_run_prefill_s": t_run_prefill_s,
+            "t_assemble_s": t_assemble_s,
+            "t_score_s": t_score_s,
+            "t_select_s": t_select_s,
         }
 
     def prune_and_base_prefill(
@@ -933,15 +944,19 @@ class SpecPrefillEngine:
         (baseline and pruned) with simple timings.
         """
         # ---- TTFT(spec_only): spec prefill + score + select ----
-        t_spec_start = time.perf_counter()
         res = self.prefill_and_score(
             prompt,
             pool_kernel_size=pool_kernel_size,
             keep_cfg=keep_cfg,
             layers_sel=layers_sel,
         )
-        t_spec_end = time.perf_counter()
-        ttft_spec_only_s = t_spec_end - t_spec_start
+        t_run_prefill_s = res.get("t_run_prefill_s", 0.0)
+        t_assemble_s = res.get("t_assemble_s", 0.0)
+        t_score_s = res.get("t_score_s", 0.0)
+        t_select_s = res.get("t_select_s", 0.0)
+        ttft_spec_device_s = t_run_prefill_s
+        ttft_host_scoring_s = t_assemble_s + t_score_s + t_select_s
+        ttft_spec_only_s = ttft_spec_device_s + ttft_host_scoring_s
         keep_idx = res["keep_idx"]
         S = res["S"]
         ids_global = res.get("ids_global", None)
@@ -1007,23 +1022,22 @@ class SpecPrefillEngine:
             pass
 
         # Always print a compact TTFT summary (ms)
-        t_rect = 0
         print(
             f"[4.3] S={S} kept={keep_idx.size} "
             f"TTFT(base_full)={ttft_baseline_s*1000:.1f}ms "
-            f"TTFT(spec_only)={t_rect*0+ttft_spec_only_s*1000:.1f}ms ".replace(
-                "t_rect*0+", ""
-            )
-            + f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms "
-            + f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
+            f"TTFT(spec_device)={ttft_spec_device_s*1000:.1f}ms "
+            f"TTFT(host_scoring)={ttft_host_scoring_s*1000:.1f}ms "
+            f"TTFT(base_pruned_only)={ttft_base_pruned_only_s*1000:.1f}ms "
+            f"TTFT(speculative)={ttft_speculative_s*1000:.1f}ms"
         )
-
         return {
             "S": S,
             "kept": int(keep_idx.size),
             "keep_idx": keep_idx,
             "ttft_baseline_s": ttft_baseline_s,
             "ttft_spec_only_s": ttft_spec_only_s,
+            "ttft_spec_device_s": ttft_spec_device_s,
+            "ttft_host_scoring_s": ttft_host_scoring_s,
             "ttft_base_pruned_only_s": ttft_base_pruned_only_s,
             "ttft_speculative_s": ttft_speculative_s,
             "padded_len_pruned": padded_len,

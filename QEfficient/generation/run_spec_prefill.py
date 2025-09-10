@@ -157,7 +157,7 @@ def main() -> None:
         ttft_base_full_s = time.time() - t0
         print("\n[TTFT]")
         print(f" S={S} kept={S} (no pruning)")
-        print(" base_full={:.1f} ms | spec_device+host=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
+        print(" base_full={:.1f} ms | spec_device=SKIPPED | host_scoring=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
         # No speculative output in this branch
         return
     else:
@@ -178,7 +178,8 @@ def main() -> None:
         S = ret.get("S", None)
         kept = ret.get("kept", None)
         ttft_base_full_ms = ret["ttft_baseline_s"] * 1000.0
-        ttft_spec_only_ms = ret["ttft_spec_only_s"] * 1000.0  # spec device prefill + host assemble/score
+        ttft_spec_device_ms = ret["ttft_spec_device_s"] * 1000.0
+        ttft_host_scoring_ms = ret["ttft_host_scoring_s"] * 1000.0
         ttft_base_pruned_ms = ret["ttft_base_pruned_only_s"] * 1000.0
         ttft_spec_total_ms = ret["ttft_speculative_s"] * 1000.0
 
@@ -186,8 +187,8 @@ def main() -> None:
         if S is not None and kept is not None:
             print(f"  S={S}  kept={kept}")
         print(
-            "  base_full={:.1f} ms | spec_device+host={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
-            .format(ttft_base_full_ms, ttft_spec_only_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
+            "  base_full={:.1f} ms | spec_device={:.1f} ms | host_scoring={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
+            .format(ttft_base_full_ms, ttft_spec_device_ms, ttft_host_scoring_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
         )
     except Exception as e:
         print(f"[TTFT] warning: could not format timing breakdown ({e}); raw ret: {ret}")
