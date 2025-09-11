@@ -560,14 +560,14 @@ class SpecPrefillEngine:
         pos_global: np.ndarray,        # [S] int64; pad positions excluded already
         *,
         layers_sel: Optional[str] = "all",   # "all", "last4", "last1"
-        agg_heads: str = "max",              # "max" or "lse"
+        agg_heads: str = "max",              # "max" or "sum" (accepts "lse" as alias)
         smooth_window: Optional[int] = None  # e.g., 3 or 5; None to skip
     ) -> Tuple[np.ndarray, Dict[str, float]]:
         """
         Compute importance[i] over full sequence S:
           1) per layer/head: softmax( q . K^T / sqrt(D) ) over S (pad already removed)
-          2) aggregate heads (max or log-sum-exp)
-          3) mean across selected layers
+          2) aggregate heads (max or sum across heads)
+          3) max across selected layers (paper §3.2.2)
           4) optional smoothing
 
         Returns:
@@ -575,6 +575,7 @@ class SpecPrefillEngine:
           diag: some diagnostics (optional)
         """
         L, H, D = int(Q_final.shape[0]), int(Q_final.shape[1]), int(Q_final.shape[2])
+        diag: Dict[str, float] = {}
         S = int(pos_global.shape[0])
         if S == 0:
             raise ValueError("Empty global sequence length S")
@@ -607,10 +608,9 @@ class SpecPrefillEngine:
             logits -= logits.max(axis=1, keepdims=True)
             probs = np.exp(logits, dtype=np.float32)
             probs /= np.maximum(probs.sum(axis=1, keepdims=True), 1e-30)
-            if agg_heads == "lse":
-                head_ag = np.exp(
-                    np.log(np.sum(probs, axis=0) + 1e-30), dtype=np.float32
-                )
+            # Head aggregation: "max" (paper default) or "sum" (previously labeled "lse")
+            if agg_heads in ("sum", "lse"):
+                head_ag = probs.sum(axis=0)
             else:
                 head_ag = probs.max(axis=0)
             layer_max = head_ag if layer_max is None else np.maximum(layer_max, head_ag)
@@ -633,7 +633,6 @@ class SpecPrefillEngine:
             assert importance.shape[0] == S, f"smoothing altered length: {importance.shape[0]} != {S}"
 
         # diagnostics
-        diag = {}
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             # quick softmax sanity on one head (first layer/head)
             g0 = 0
@@ -695,30 +694,9 @@ class SpecPrefillEngine:
             idx = np.unique(np.concatenate([idx, np.array([S - 1], dtype=np.int64)]))
         return idx
 
-    # ---- helper: get last token id+text from a prefill outputs dict ----
-    @staticmethod
-    def _next_token_from_outputs(outputs: Dict[str, Any], tokenizer) -> Tuple[Optional[int], Optional[str]]:
-        logits = outputs.get("logits", None)
-        if logits is None:
-            return None, None
-        if logits.ndim == 2:
-            logits = np.expand_dims(logits, 1)  # [B,V] -> [B,1,V]
-        tok_id = int(logits.argmax(2)[0, 0])
-        tok_text = tokenizer.decode([tok_id], skip_special_tokens=True)
-        return tok_id, tok_text
-
     def _collect_anchor_queries(self, N: int, S: int) -> List[np.ndarray]:
         anchors: List[np.ndarray] = [self._prefill_cache["Q_final"]]
-        token_strs: List[str] = []
-        # log first anchor token if available
-        tok_id0, tok_text0 = self._next_token_from_outputs(
-            getattr(self, "_last_outputs", {}), self.tokenizer
-        )
-        if tok_text0 is not None:
-            token_strs.append(tok_text0)
         if N <= 0:
-            if os.getenv("QEFF_SPEC_DEBUG", ""):
-                print(f"[spec:anchors] used=1 tokens={token_strs}")
             return anchors
 
         if (
@@ -726,8 +704,6 @@ class SpecPrefillEngine:
             or (not self._session.allowed_shapes)
             or (len(self._session.allowed_shapes) < 2)
         ):
-            if os.getenv("QEFF_SPEC_DEBUG", ""):
-                print(f"[spec:anchors] used=1 tokens={token_strs}")
             return anchors
 
         idx = self._session.binding_index_map["prefill_queries"]
@@ -740,9 +716,13 @@ class SpecPrefillEngine:
             if last is None or "logits" not in last:
                 break
             next_token = int(np.argmax(last["logits"][0, -1, :]))
-            token_strs.append(
-                self.tokenizer.decode([next_token], skip_special_tokens=True)
-            )
+            # Optional early stop on EOS if tokenizer is available
+            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+            try:
+                if eos_id is not None and next_token == int(eos_id):
+                    break
+            except Exception:
+                pass
             dec_inputs = {
                 "input_ids": np.array([[next_token]], dtype=np.int64),
                 "position_ids": np.array([[next_pos]], dtype=np.int64),
@@ -755,7 +735,8 @@ class SpecPrefillEngine:
             next_pos += 1
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
-            print(f"[spec:anchors] used={len(anchors)} tokens={token_strs[:3]}")
+            # Keep this lightweight; token strings are optional and may not be available here
+            print(f"[spec:anchors] used={len(anchors)}", flush=True)
         return anchors
 
     def _score_importance_multi_anchor(
@@ -1069,14 +1050,15 @@ class SpecPrefillEngine:
         prefill_logit_bs: int = 1,
         layers_sel: str = "all",
         gen_len: Optional[int] = None,
-        look_ahead: int = 0,
+        look_ahead: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
         (baseline and pruned) with simple timings.
         """
+        # Persist look-ahead for downstream helpers (defaults to 0 if absent)
+        self._look_ahead = int(look_ahead) if look_ahead is not None else 0
         # ---- TTFT(spec_only): spec prefill + score + select ----
-        self._look_ahead = int(look_ahead)
         res = self.prefill_and_score(
             prompt,
             pool_kernel_size=pool_kernel_size,
