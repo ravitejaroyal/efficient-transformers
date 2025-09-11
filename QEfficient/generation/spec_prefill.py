@@ -998,6 +998,12 @@ class SpecPrefillEngine:
         keep_idx = np.union1d(
             keep_idx.astype(np.int64, copy=False), np.array([S_total - 1], dtype=np.int64)
         )
+        try:
+            last_id = int(ids_global[S_total - 1])
+            last_tok = self.tokenizer.convert_ids_to_tokens([last_id])[0]
+            print(f"[spec:prefill] last prompt token: {last_tok!r}")
+        except Exception:
+            pass
         t4 = time.perf_counter()
 
         # collect timing diagnostics for caller
