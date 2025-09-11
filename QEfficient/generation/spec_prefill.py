@@ -13,7 +13,11 @@ from QEfficient.generation.base_infer import write_io_files
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils.logging_utils import logger
 
-
+# Changes:
+#  * multi-anchor look-ahead scoring and averaging
+#  * block Top-K selection at call-site
+#  * vectorized head scoring with layer streaming
+#  * clarified "next predicted token" log and added debug prints
 @dataclass
 class KeepConfig:
     strategy: str = "percentage"  # only "percentage" in this step
@@ -376,7 +380,10 @@ class SpecPrefillEngine:
             token_id = int(last_logits.argmax())
             token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
             if os.getenv("QEFF_SPEC_DEBUG", ""):
-                print(f"[spec:prefill] final token: {token_text!r}", flush=True)
+                print(
+                    f"[spec:prefill] next predicted token: {token_text!r}",
+                    flush=True,
+                )
 
         # Cache last outputs for possible look-ahead
         self._last_outputs = outputs_last
@@ -574,65 +581,41 @@ class SpecPrefillEngine:
 
         # choose layers
         if layers_sel == "last1":
-            layer_ids = [L-1]
+            layer_ids = [L - 1]
         elif layers_sel == "last4":
-            layer_ids = list(range(max(L-4, 0), L))
+            layer_ids = list(range(max(L - 4, 0), L))
         else:
             layer_ids = list(range(L))
-        L_sel = len(layer_ids)
 
         # derive GQA group size: Hkv taken from K_global[0].shape[0]
         H_kv = int(K_global[layer_ids[0]].shape[0])
         group_size = H // H_kv
         if group_size * H_kv != H:
-            # fallback to repeat (rare)
             group_size = 1
-
-        # output per-layer aggregated [S]
-        layer_scores = np.empty((L_sel, S), dtype=np.float32)
 
         # precompute sqrt(D)
         scale = 1.0 / math.sqrt(float(D))
 
-        # per layer
-        ell = 0
+        # Vectorized head scoring with layer streaming
+        layer_max = None
+        head_to_kv = (np.arange(H) // group_size).astype(np.int64)
         for li in layer_ids:
-            K_l = K_global[li].astype(np.float32, copy=False)        # [H_kv, S, D] fp32
-            Q_l = Q_final[li].astype(np.float32, copy=False)         # [H, D]
-            # per head logits -> softmax -> attention over S
-            # We'll aggregate across heads as we go
+            K_l = K_global[li].astype(np.float32, copy=False)  # [H_kv,S,D]
+            Q_l = Q_final[li].astype(np.float32, copy=False)   # [H,D]
+            K_sel = K_l[head_to_kv, :, :]                      # [H,S,D]
+            logits = np.einsum("hsd,hd->hs", K_sel, Q_l) * scale  # [H,S]
+            logits -= logits.max(axis=1, keepdims=True)
+            probs = np.exp(logits, dtype=np.float32)
+            probs /= np.maximum(probs.sum(axis=1, keepdims=True), 1e-30)
             if agg_heads == "lse":
-                # log-sum-exp over heads -> use logits then combine
-                head_vals = np.empty((H, S), dtype=np.float32)
-                for h in range(H):
-                    g = h // group_size
-                    q = Q_l[h, :]                                    # [D]
-                    z = K_l[g, :, :] @ q                             # [S]
-                    z = z * scale
-                    a = self._softmax_1d_safe(z)                     # [S]
-                    head_vals[h, :] = a
-                # aggregate heads: lse or mean; use lse for "lse"
-                # log-sum-exp in prob-space ~ sum
-                a_heads = np.log(np.sum(head_vals, axis=0) + 1e-30)  # [S]
-                a_heads = np.exp(a_heads, dtype=np.float32)          # back to prob-like scale
+                head_ag = np.exp(
+                    np.log(np.sum(probs, axis=0) + 1e-30), dtype=np.float32
+                )
             else:
-                # max over heads (default)
-                head_max = np.zeros((S,), dtype=np.float32)
-                for h in range(H):
-                    g = h // group_size
-                    q = Q_l[h, :]
-                    z = K_l[g, :, :] @ q                             # [S]
-                    z = z * scale
-                    a = self._softmax_1d_safe(z)                     # [S]
-                    # max across heads
-                    head_max = np.maximum(head_max, a)
-                a_heads = head_max                                   # [S]
+                head_ag = probs.max(axis=0)
+            layer_max = head_ag if layer_max is None else np.maximum(layer_max, head_ag)
 
-            layer_scores[ell, :] = a_heads
-            ell += 1
-
-        # paper §3.2.2: max over layers (after head aggregation)
-        importance = np.max(layer_scores, axis=0)  # [S]
+        importance = layer_max  # [S]
 
         # optional smoothing (simple moving average; length-preserving)
         if smooth_window is not None and smooth_window > 1:
@@ -725,17 +708,27 @@ class SpecPrefillEngine:
         return tok_id, tok_text
 
     def _collect_anchor_queries(self, N: int, S: int) -> List[np.ndarray]:
-        anchors = []
-        anchors.append(self._prefill_cache["Q_final"])
+        anchors: List[np.ndarray] = [self._prefill_cache["Q_final"]]
+        token_strs: List[str] = []
+        # log first anchor token if available
+        tok_id0, tok_text0 = self._next_token_from_outputs(
+            getattr(self, "_last_outputs", {}), self.tokenizer
+        )
+        if tok_text0 is not None:
+            token_strs.append(tok_text0)
         if N <= 0:
-            return anchors[0:1]
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                print(f"[spec:anchors] used=1 tokens={token_strs}")
+            return anchors
 
         if (
             ("prefill_queries" not in self._session.binding_index_map)
             or (not self._session.allowed_shapes)
             or (len(self._session.allowed_shapes) < 2)
         ):
-            return anchors[0:1]
+            if os.getenv("QEFF_SPEC_DEBUG", ""):
+                print(f"[spec:anchors] used=1 tokens={token_strs}")
+            return anchors
 
         idx = self._session.binding_index_map["prefill_queries"]
         _, dec_dims = self._session.allowed_shapes[1][idx]
@@ -743,10 +736,13 @@ class SpecPrefillEngine:
 
         next_pos = S
         for _ in range(N):
-            last = self._last_outputs if hasattr(self, "_last_outputs") else None
+            last = getattr(self, "_last_outputs", None)
             if last is None or "logits" not in last:
                 break
             next_token = int(np.argmax(last["logits"][0, -1, :]))
+            token_strs.append(
+                self.tokenizer.decode([next_token], skip_special_tokens=True)
+            )
             dec_inputs = {
                 "input_ids": np.array([[next_token]], dtype=np.int64),
                 "position_ids": np.array([[next_pos]], dtype=np.int64),
@@ -758,6 +754,8 @@ class SpecPrefillEngine:
                 anchors.append(out["prefill_queries"].copy())
             next_pos += 1
 
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            print(f"[spec:anchors] used={len(anchors)} tokens={token_strs[:3]}")
         return anchors
 
     def _score_importance_multi_anchor(
@@ -984,7 +982,8 @@ class SpecPrefillEngine:
         if ids_global.shape[0] != S_total:
             raise AssertionError(f"ids_global len {ids_global.shape[0]} != S {S_total}")
 
-        if keep_cfg and getattr(keep_cfg, "chunk", True):
+        blocks = bool(keep_cfg and getattr(keep_cfg, "chunk", True))
+        if blocks:
             keep_idx = self._select_blocks_topk(
                 importance,
                 keep_cfg.percentage,
@@ -995,6 +994,15 @@ class SpecPrefillEngine:
             keep_idx = self._select_global_topk(
                 importance, keep_cfg.percentage, force_last=True
             )
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            try:
+                print(
+                    f"[spec:select] blocks={blocks} chunk_size={getattr(keep_cfg, 'chunk_size', None)} "
+                    f"kept={len(keep_idx)}/{S_total}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         keep_idx = np.union1d(
             keep_idx.astype(np.int64, copy=False), np.array([S_total - 1], dtype=np.int64)
         )
