@@ -84,8 +84,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    os.environ.setdefault("QEFF_SPEC_DEBUG", "1")
-
     # ---- Parse device lists (accepts "[0,1]" or "0,1" or "[0]") ----
     def _parse_ids(s: Optional[str]) -> List[int]:
         if not s:
