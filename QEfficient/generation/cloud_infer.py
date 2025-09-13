@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Union
 from warnings import warn
 
 import numpy as np
+import os
+import time
 
 try:
     import qaicrt
@@ -110,6 +112,7 @@ class QAICInferenceSession:
                 for binding in self.bindings
             ]
         )
+        self._io_metrics = None  # I/O metrics from most recent run()
 
     @property
     def input_names(self) -> List[str]:
@@ -126,6 +129,10 @@ class QAICInferenceSession:
             for binding in self.bindings
             if binding.dir == aicapi.BUFFER_IO_TYPE_OUTPUT
         ]
+
+    def get_last_io_metrics(self):
+        """Return dict with device->host I/O metrics for most recent run()."""
+        return self._io_metrics or {}
 
     def activate(self):
         """Activate qpc"""
@@ -195,8 +202,6 @@ class QAICInferenceSession:
         Return:
             :Dict[str, np.ndarray]:
         """
-        import os
-        import time
 
         t0 = time.perf_counter()
         self.set_buffers(inputs)
@@ -239,22 +244,58 @@ class QAICInferenceSession:
         if status != qaicrt.QStatus.QS_SUCCESS:
             raise MemoryError("Failed to getData")
         t_get = time.perf_counter()
-        outputs = {}
+        outputs: Dict[str, np.ndarray] = {}
         total_bytes = 0
+        io_details = []
+        cat_totals: Dict[str, Dict[str, float]] = {}
+
+        def _cat(name: str) -> str:
+            if name == "prefill_queries":
+                return "prefill_queries"
+            if name == "logits":
+                return "logits"
+            if name.startswith("past_key."):
+                return "past_key"
+            if name.startswith("past_value."):
+                return "past_value"
+            return "other"
+
+        io_t0 = time.perf_counter()
         for output_name in self.output_names:
             buffer_index = self.binding_index_map[output_name]
             if self.qbuffers[buffer_index].size == 0:
                 continue
+            o_t0 = time.perf_counter()
             arr = np.frombuffer(
                 bytes(output_qbuffers[buffer_index]),
                 aic_to_np_dtype_mapping[self.bindings[buffer_index].type],
             )
             shaped = arr.reshape(tuple(self.buf_dims[buffer_index][1]))
+            o_ms = (time.perf_counter() - o_t0) * 1000.0
             outputs[output_name] = shaped
-            try:
-                total_bytes += int(arr.size) * arr.itemsize
-            except Exception:
-                pass
+            nbytes = int(arr.size) * arr.itemsize
+            total_bytes += nbytes
+            io_details.append((output_name, nbytes, o_ms))
+            cat = _cat(output_name)
+            if cat not in cat_totals:
+                cat_totals[cat] = {"bytes": 0, "ms": 0.0}
+            cat_totals[cat]["bytes"] += nbytes
+            cat_totals[cat]["ms"] += o_ms
+        io_ms = (time.perf_counter() - io_t0) * 1000.0
+        self._io_metrics = {
+            "total_bytes": int(total_bytes),
+            "total_ms": float(io_ms),
+            "details": io_details,
+            "categories": cat_totals,
+        }
+        if os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", ""):
+            cats = " ".join(
+                f"{k}:{v['bytes']}B/{v['ms']:.3f}ms" for k, v in sorted(cat_totals.items())
+            )
+            print(
+                f"[aic.run:io] total={total_bytes}B {io_ms:.3f}ms cats={cats}",
+                flush=True,
+            )
         t_unmarshal = time.perf_counter()
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
