@@ -206,12 +206,20 @@ class SpecPrefillEngine:
         )
         self._session.set_buffers({"logits": logits_out_placeholder})
 
-        # Do NOT bind 'prefill_queries' persistently for all chunks; skip by default and enable on the final chunk.
+        # Re-bind 'prefill_queries' for ALL prefill chunks (required for some QPCs that mark it non-partial).
         pq_idx = self._session.binding_index_map.get("prefill_queries", None)
-        if pq_idx is not None:
-            self._session.skip_buffers(["prefill_queries"])
-            if os.getenv("QEFF_SPEC_DEBUG", ""):
-                print("[spec:gate] prefill_queries skipped for early chunks", flush=True)
+        try:
+            if pq_idx is not None:
+                if self._session.allowed_shapes:
+                    dims = list(self._session.allowed_shapes[0][pq_idx][1])  # prefill spec = 0
+                else:
+                    dims = list(self._session.bindings[pq_idx].dims)
+                pq_placeholder = np.empty(tuple(dims), dtype=np.float32)
+                self._session.set_buffers({"prefill_queries": pq_placeholder})
+                if os.getenv("QEFF_SPEC_DEBUG", ""):
+                    print(f"[spec:gate] prefill_queries bound with dims={tuple(dims)} dtype=float32", flush=True)
+        except Exception:
+            pass
 
         inputs = self.tokenizer(
             prompt, return_tensors="np", padding="max_length", max_length=padded_len
@@ -325,13 +333,11 @@ class SpecPrefillEngine:
             ]
             last = (i == num_chunks - 1)
 
-            # Enable heavy outputs only for the final chunk: retained-state keys and prefill_queries (anchor 0)
+            # Enable heavy outputs only for the final chunk: retained-state keys (prefill_queries stays bound)
             if last:
                 names_to_enable: List[str] = []
                 if keep_bindings:
                     names_to_enable += keep_bindings
-                if pq_idx is not None:
-                    names_to_enable.append("prefill_queries")
                 if names_to_enable:
                     e0 = time.perf_counter()
                     try:
