@@ -118,25 +118,26 @@ def main() -> None:
         device_id=base_device_ids,
     )._qaic_model
 
-    print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
-    out_full, pos_ids, gen_len = base.run_prefill(
-        [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
-    )
-    orig_seq_len = int(pos_ids.max())
-    enc_full = tokenizer(prompt_text, return_tensors="np")
-    ids_full = enc_full["input_ids"][:, :orig_seq_len]
-    pos_full = np.arange(orig_seq_len, dtype=np.int64).reshape(1, -1)
+    if os.getenv("QEFF_SPEC_DEBUG", ""):
+        print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
+        out_full, pos_ids, gen_len = base.run_prefill(
+            [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+        )
+        orig_seq_len = int(pos_ids.max())
+        enc_full = tokenizer(prompt_text, return_tensors="np")
+        ids_full = enc_full["input_ids"][:, :orig_seq_len]
+        pos_full = np.arange(orig_seq_len, dtype=np.int64).reshape(1, -1)
 
-    out_ids, seq_len_ret, padded_len, num_chunks = base.prefill_from_ids(
-        ids_full, pos_full, prefill_logit_bs=1
-    )
-    assert "logits" in out_ids, "prefill_from_ids missing logits"
-    assert seq_len_ret == orig_seq_len, f"orig_seq_len mismatch: {seq_len_ret} != {orig_seq_len}"
-    print(
-        f"[unit] OK  orig_seq_len={seq_len_ret}  padded_len={padded_len}  num_chunks={num_chunks}"
-    )
+        out_ids, seq_len_ret, padded_len, num_chunks = base.prefill_from_ids(
+            ids_full, pos_full, prefill_logit_bs=1
+        )
+        assert "logits" in out_ids, "prefill_from_ids missing logits"
+        assert seq_len_ret == orig_seq_len, f"orig_seq_len mismatch: {seq_len_ret} != {orig_seq_len}"
+        print(
+            f"[unit] OK  orig_seq_len={seq_len_ret}  padded_len={padded_len}  num_chunks={num_chunks}"
+        )
 
-    print("\n[2/2] Integration: spec prefill → importance → keep_idx → base.prefill_from_ids")
+        print("\n[2/2] Integration: spec prefill → importance → keep_idx → base.prefill_from_ids")
     keep_cfg = KeepConfig(
         strategy="percentage",
         percentage=float(args.keep_percentage),
