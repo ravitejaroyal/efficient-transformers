@@ -200,35 +200,18 @@ class SpecPrefillEngine:
 
         max_gen_len = self._ctx_len - position_ids.max()
         generation_len = self._fetch_generation_len(generation_len, max_gen_len)
-        # Bind persistent output buffers for logits and prefill_queries so the
-        # runtime always sees real buffers for every chunk.
+        # Bind persistent output buffers for logits so the runtime always sees a real buffer.
         logits_out_placeholder = np.zeros(
             (prefill_logit_bs, 1, self._vocab_size), dtype=np.float32
         )
         self._session.set_buffers({"logits": logits_out_placeholder})
 
-        # --- IMPORTANT: bind a real buffer for 'prefill_queries' for ALL chunks ---
-        # Some QPCs mark this output as non-partial; a zero-length buffer will fail setData.
-        try:
-            if "prefill_queries" in self._session.binding_index_map:
-                idx = self._session.binding_index_map["prefill_queries"]
-                # Prefer allowed_shapes for dimensions; fall back to selected binding dims
-                if self._session.allowed_shapes:
-                    dims = list(self._session.allowed_shapes[0][idx][1])
-                else:
-                    dims = list(self._session.bindings[idx].dims)
-                # 'prefill_queries' is exported as FP32 in our exporter
-                pq_placeholder = np.empty(tuple(dims), dtype=np.float32)
-                self._session.set_buffers({"prefill_queries": pq_placeholder})
-                if os.getenv("QEFF_SPEC_DEBUG", ""):
-                    print(
-                        f"[spec:gate] prefill_queries bound with dims={tuple(dims)} dtype=float32",
-                        flush=True,
-                    )
-        except Exception as e:
-            # Do not crash if binding info is unavailable; let the next run() raise a clearer error
+        # Do NOT bind 'prefill_queries' persistently for all chunks; skip by default and enable on the final chunk.
+        pq_idx = self._session.binding_index_map.get("prefill_queries", None)
+        if pq_idx is not None:
+            self._session.skip_buffers(["prefill_queries"])
             if os.getenv("QEFF_SPEC_DEBUG", ""):
-                print(f"[spec:gate] prefill_queries binding skipped due to: {e}", flush=True)
+                print("[spec:gate] prefill_queries skipped for early chunks", flush=True)
 
         inputs = self.tokenizer(
             prompt, return_tensors="np", padding="max_length", max_length=padded_len
@@ -328,6 +311,7 @@ class SpecPrefillEngine:
         chunks_ids: List[np.ndarray] = []
         outputs_last = None
         per_chunk_times: List[Tuple[int, float]] = []
+        per_chunk_io: List[Dict[str, Any]] = []
 
         want_logits = bool(os.getenv("QEFF_SPEC_DEBUG", ""))
 
@@ -339,23 +323,48 @@ class SpecPrefillEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
-            # NOTE: 'prefill_queries' is bound every chunk but only needed on the last one.
+            last = (i == num_chunks - 1)
 
-            # Re-enable past_key.* only for the final chunk to fetch the full retained state once
-            if i == num_chunks - 1:
-                # Enable retained-state bindings only for the final chunk
-                try:
-                    self._session.enable_outputs(keep_bindings)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[spec] enable_outputs failed for retained-state keys: {e}"
-                    )
+            # Enable heavy outputs only for the final chunk: retained-state keys and prefill_queries (anchor 0)
+            if last:
+                names_to_enable: List[str] = []
+                if keep_bindings:
+                    names_to_enable += keep_bindings
+                if pq_idx is not None:
+                    names_to_enable.append("prefill_queries")
+                if names_to_enable:
+                    e0 = time.perf_counter()
+                    try:
+                        self._session.enable_outputs(names_to_enable)
+                    except Exception as e:
+                        raise RuntimeError(f"[spec] enable_outputs failed: {e}")
+                    e_ms = (time.perf_counter() - e0) * 1000.0
+                    if os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", ""):
+                        print(f"[spec:io] enable_outputs_ms={e_ms:.3f}", flush=True)
 
             t0 = time.perf_counter()
             outputs = self._session.run(chunk_inputs)
             dt = time.perf_counter() - t0
             per_chunk_times.append((i, dt))
             outputs_last = outputs
+
+            # per-chunk I/O metrics
+            io_metrics = self._session.get_last_io_metrics()
+            per_chunk_io.append(io_metrics)
+            if os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", ""):
+                cats = io_metrics.get("categories", {})
+                cats_str = " ".join(
+                    f"{k}:{v['bytes']}B/{v['ms']:.3f}ms" for k, v in sorted(cats.items())
+                )
+                print(
+                    f"[spec:io] chunk {i} total={io_metrics.get('total_bytes',0)}B "
+                    f"{io_metrics.get('total_ms',0.0):.3f}ms cats={cats_str}",
+                    flush=True,
+                )
+
+            # (Optional) immediately skip keys again to avoid accidental DMA during decode anchors
+            if last and keep_bindings:
+                self._session.skip_buffers(keep_bindings)
 
             # record positions and ids for *every* chunk
             chunks_pos.append(chunk_inputs["position_ids"].copy())
@@ -371,6 +380,26 @@ class SpecPrefillEngine:
                     True,
                     False,
                 )
+
+        if (os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", "")) and per_chunk_io:
+            total_bytes = 0
+            total_ms = 0.0
+            cat_totals: Dict[str, Dict[str, float]] = {}
+            for m in per_chunk_io:
+                total_bytes += int(m.get("total_bytes", 0))
+                total_ms += float(m.get("total_ms", 0.0))
+                for k, v in m.get("categories", {}).items():
+                    if k not in cat_totals:
+                        cat_totals[k] = {"bytes": 0, "ms": 0.0}
+                    cat_totals[k]["bytes"] += int(v.get("bytes", 0))
+                    cat_totals[k]["ms"] += float(v.get("ms", 0.0))
+            cats = " ".join(
+                f"{k}:{v['bytes']}B/{v['ms']:.3f}ms" for k, v in sorted(cat_totals.items())
+            )
+            print(
+                f"[spec:io] summary total={total_bytes}B {total_ms:.3f}ms cats={cats}",
+                flush=True,
+            )
 
         if outputs_last is None:
             raise RuntimeError("No outputs from prefill; empty prompt?")
