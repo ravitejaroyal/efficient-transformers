@@ -627,11 +627,20 @@ class SpecPrefillEngine:
         else:
             layer_ids = list(range(L))
 
-        # derive GQA group size: Hkv taken from K_global[0].shape[0]
+        # ---- GQA invariants (assert hard and print once when debug is on) ----
         H_kv = int(K_global[layer_ids[0]].shape[0])
+        D_k = int(K_global[layer_ids[0]].shape[2])
+        assert H_kv > 0, f"GQA invalid: H_kv={H_kv}"
+        assert D_k == D, f"D mismatch Q vs K: Dq={D}, Dk={D_k}"
+        assert H % H_kv == 0, f"GQA mismatch: H={H}, H_kv={H_kv} (H must be a multiple of H_kv)"
         group_size = H // H_kv
-        if group_size * H_kv != H:
-            group_size = 1
+        if os.getenv("QEFF_SPEC_DEBUG", ""):
+            # Example: [spec:invariants] S_total=64539 Q_final=(32,32,128) K0=(8,64539,128) H=32 H_kv=8 group=4
+            print(
+                f"[spec:invariants] S_total={S} Q_final=({L},{H},{D}) "
+                f"K0=({H_kv},{S},{D_k}) H={H} H_kv={H_kv} group={group_size}",
+                flush=True,
+            )
 
         # precompute sqrt(D)
         scale = 1.0 / math.sqrt(float(D))
@@ -982,19 +991,6 @@ class SpecPrefillEngine:
 
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
-
-        # ---- ALWAYS-ON invariants & shape/gqa print ----
-        try:
-            L_q, H_q, D_q = tuple(Q_final.shape)
-            H_kv_0, S0, D0 = tuple(K_global[0].shape)
-            group_size = H_q // max(1, H_kv_0)
-            print(
-                f"[spec:invariants] S_total={S_total}  Q_final={Q_final.shape}  "
-                f"K0={K_global[0].shape}  H={H_q} H_kv={H_kv_0} group={group_size}",
-                flush=True,
-            )
-        except Exception:
-            pass
 
         # Hard sanity checks (not gated)
         if importance.shape[0] != S_total:
