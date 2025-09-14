@@ -319,7 +319,14 @@ class SpecPrefillEngine:
         chunks_ids: List[np.ndarray] = []
         outputs_last = None
         per_chunk_times: List[Tuple[int, float]] = []
-        per_chunk_io: List[Dict[str, Any]] = []
+        io_totals = {k: {"bytes": 0, "ms": 0.0} for k in (
+            "prefill_queries",
+            "past_key",
+            "past_value",
+            "logits",
+            "other",
+        )}
+        io_total_ms = 0.0
 
         want_logits = bool(os.getenv("QEFF_SPEC_DEBUG", ""))
 
@@ -352,21 +359,24 @@ class SpecPrefillEngine:
             outputs = self._session.run(chunk_inputs)
             dt = time.perf_counter() - t0
             per_chunk_times.append((i, dt))
-            outputs_last = outputs
-
-            # per-chunk I/O metrics
-            io_metrics = self._session.get_last_io_metrics()
-            per_chunk_io.append(io_metrics)
+            # accumulate device->host IO for this chunk
+            io = self._session.get_last_io_metrics()
+            cats = io.get("categories", {})
+            for k in io_totals.keys():
+                v = cats.get(k, {})
+                io_totals[k]["bytes"] += int(v.get("bytes", 0))
+                io_totals[k]["ms"] += float(v.get("ms", 0.0))
+            io_total_ms += float(io.get("total_ms", 0.0))
             if os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", ""):
-                cats = io_metrics.get("categories", {})
                 cats_str = " ".join(
                     f"{k}:{v['bytes']}B/{v['ms']:.3f}ms" for k, v in sorted(cats.items())
                 )
                 print(
-                    f"[spec:io] chunk {i} total={io_metrics.get('total_bytes',0)}B "
-                    f"{io_metrics.get('total_ms',0.0):.3f}ms cats={cats_str}",
+                    f"[spec:io] chunk {i} total={io.get('total_bytes',0)}B "
+                    f"{io.get('total_ms',0.0):.3f}ms cats={cats_str}",
                     flush=True,
                 )
+            outputs_last = outputs
 
             # (Optional) immediately skip keys again to avoid accidental DMA during decode anchors
             if last and keep_bindings:
@@ -387,23 +397,17 @@ class SpecPrefillEngine:
                     False,
                 )
 
-        if (os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", "")) and per_chunk_io:
-            total_bytes = 0
-            total_ms = 0.0
-            cat_totals: Dict[str, Dict[str, float]] = {}
-            for m in per_chunk_io:
-                total_bytes += int(m.get("total_bytes", 0))
-                total_ms += float(m.get("total_ms", 0.0))
-                for k, v in m.get("categories", {}).items():
-                    if k not in cat_totals:
-                        cat_totals[k] = {"bytes": 0, "ms": 0.0}
-                    cat_totals[k]["bytes"] += int(v.get("bytes", 0))
-                    cat_totals[k]["ms"] += float(v.get("ms", 0.0))
+        # Save and optionally print per-prefill IO summary
+        self._prefill_io_totals = io_totals
+        self._prefill_io_total_ms = io_total_ms
+        if (os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", "")) and io_total_ms:
             cats = " ".join(
-                f"{k}:{v['bytes']}B/{v['ms']:.3f}ms" for k, v in sorted(cat_totals.items())
+                f"{k}:{io_totals[k]['bytes']}B/{io_totals[k]['ms']:.3f}ms"
+                for k in sorted(io_totals.keys())
             )
             print(
-                f"[spec:io] summary total={total_bytes}B {total_ms:.3f}ms cats={cats}",
+                f"[spec:io] summary total={sum(io_totals[k]['bytes'] for k in io_totals)}B "
+                f"{io_total_ms:.3f}ms cats={cats}",
                 flush=True,
             )
 
@@ -1107,6 +1111,30 @@ class SpecPrefillEngine:
         ttft_spec_device_s = t_run_prefill_s
         ttft_host_scoring_s = t_assemble_s + t_score_s + t_select_s
         ttft_spec_only_s = ttft_spec_device_s + ttft_host_scoring_s
+        # aggregated device->host IO across prefill
+        io_totals = getattr(
+            self,
+            "_prefill_io_totals",
+            {k: {"bytes": 0, "ms": 0.0} for k in (
+                "prefill_queries",
+                "past_key",
+                "past_value",
+                "logits",
+                "other",
+            )},
+        )
+        io_total_ms = float(getattr(self, "_prefill_io_total_ms", 0.0))
+        if os.getenv("QEFF_SPEC_IO_TIMING", "") or os.getenv("QEFF_SPEC_DEBUG", ""):
+            cats_str = " ".join(
+                f"{k}:{io_totals[k]['bytes']}B/{io_totals[k]['ms']:.1f}ms"
+                for k in sorted(io_totals.keys())
+            )
+            spec_compute_ms = max(ttft_spec_device_s * 1000.0 - io_total_ms, 0.0)
+            print(
+                f"[spec:io-total] {cats_str} | io_total={io_total_ms:.1f}ms | "
+                f"spec_compute_only={spec_compute_ms:.1f}ms",
+                flush=True,
+            )
         keep_idx = res["keep_idx"]
         S = res["S"]
         ids_global = res.get("ids_global", None)
