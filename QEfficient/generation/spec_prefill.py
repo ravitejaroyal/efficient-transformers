@@ -634,13 +634,12 @@ class SpecPrefillEngine:
         assert D_k == D, f"D mismatch Q vs K: Dq={D}, Dk={D_k}"
         assert H % H_kv == 0, f"GQA mismatch: H={H}, H_kv={H_kv} (H must be a multiple of H_kv)"
         group_size = H // H_kv
-        if os.getenv("QEFF_SPEC_DEBUG", ""):
-            # Example: [spec:invariants] S_total=64539 Q_final=(32,32,128) K0=(8,64539,128) H=32 H_kv=8 group=4
-            print(
-                f"[spec:invariants] S_total={S} Q_final=({L},{H},{D}) "
-                f"K0=({H_kv},{S},{D_k}) H={H} H_kv={H_kv} group={group_size}",
-                flush=True,
-            )
+        # Example: [spec:invariants] S_total=64539 Q_final=(32,32,128) K0=(8,64539,128) H=32 H_kv=8 group=4
+        print(
+            f"[spec:invariants] S_total={S} Q_final=({L},{H},{D}) "
+            f"K0=({H_kv},{S},{D_k}) H={H} H_kv={H_kv} group={group_size}",
+            flush=True,
+        )
 
         # precompute sqrt(D)
         scale = 1.0 / math.sqrt(float(D))
