@@ -5,11 +5,14 @@
 #
 # ----------------------------------------------------------------------------
 
-from typing import Optional, Tuple
+import math
+import os
+import re
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
-from onnx import ModelProto, external_data_helper, numpy_helper
+from onnx import ModelProto, TensorProto, external_data_helper, helper, numpy_helper, shape_inference
 
 
 class OnnxTransform:
@@ -100,4 +103,341 @@ class SplitTensorsTransform(OnnxTransform):
                     current_file_size = tsize
                 external_data_helper.set_external_data(tensor, f"{model_name}_{file_num}.onnx.data")
         return model, transformed
+
+
+class ScoringHeadTransform(OnnxTransform):
+    """Insert device-side scoring head taps for selected transformer layers."""
+
+    @classmethod
+    def apply(cls, model: ModelProto, **cfg) -> Tuple[ModelProto, bool]:
+        debug_enabled = os.getenv("QEFF_SCORING_DEBUG", "0") == "1"
+
+        def dprint(*args):
+            if debug_enabled:
+                print("[ScoringHeadTransform]", *args)
+
+        layers_for_scoring = str(cfg.get("layers_for_scoring", "all"))
+        emit_single_output = bool(cfg.get("emit_single_output", False))
+        importance_dtype = str(cfg.get("importance_dtype", "float16")).lower()
+        smoothing_window = int(cfg.get("smoothing_window", 3))
+        layer_name_regex = cfg.get("layer_name_regex", r"model\.layers\.(\d+)\.self_attn")
+        q_last_suffix = cfg.get("q_last_suffix", "Gather_2_output_0")
+        k_transpose_suffix = cfg.get("k_transpose_suffix", "Transpose_1_output_0")
+
+        dtype_map = {
+            "float16": TensorProto.FLOAT16,
+            "fp16": TensorProto.FLOAT16,
+            "float32": TensorProto.FLOAT,
+            "fp32": TensorProto.FLOAT,
+        }
+        dtype_enum = dtype_map.get(importance_dtype, TensorProto.FLOAT16)
+        np_dtype = np.float16 if dtype_enum == TensorProto.FLOAT16 else np.float32
+
+        try:
+            model = shape_inference.infer_shapes(model)
+        except Exception as exc:  # pragma: no cover - best effort
+            dprint(f"initial shape inference skipped: {exc}")
+
+        graph = model.graph
+        node_by_output = {}
+        for node in graph.node:
+            for output in node.output:
+                node_by_output[output] = node
+
+        layer_pattern = re.compile(layer_name_regex)
+
+        def collect_shapes() -> Dict[str, List[Optional[int]]]:
+            shapes: Dict[str, List[Optional[int]]] = {}
+
+            def update_from_vi(vi):
+                if not vi or not vi.type.HasField("tensor_type"):
+                    return
+                dims: List[Optional[int]] = []
+                for dim in vi.type.tensor_type.shape.dim:
+                    if dim.HasField("dim_value"):
+                        dims.append(dim.dim_value)
+                    elif dim.HasField("dim_param"):
+                        dims.append(dim.dim_param)
+                    else:
+                        dims.append(None)
+                shapes[vi.name] = dims
+
+            for vi in list(graph.value_info) + list(graph.output) + list(graph.input):
+                update_from_vi(vi)
+
+            for initializer in graph.initializer:
+                shapes[initializer.name] = list(initializer.dims)
+
+            return shapes
+
+        shape_dict = collect_shapes()
+
+        def get_dim_value(name: str, index: int) -> Optional[int]:
+            dims = shape_dict.get(name)
+            if not dims or index >= len(dims):
+                return None
+            value = dims[index]
+            return value if isinstance(value, int) else None
+
+        all_layers: List[int] = []
+        for node in graph.node:
+            for output in node.output:
+                if not output.endswith(k_transpose_suffix):
+                    continue
+                match = layer_pattern.search(output)
+                if match:
+                    try:
+                        all_layers.append(int(match.group(1)))
+                    except ValueError:
+                        continue
+
+        all_layers = sorted(set(all_layers))
+        if not all_layers:
+            dprint("no eligible layers located")
+            return model, False
+
+        def resolve_layers(spec: str, layer_count: int) -> List[int]:
+            spec = spec.strip()
+            spec_lower = spec.lower()
+            if spec_lower == "all":
+                return list(range(layer_count))
+            if spec_lower.startswith("last"):
+                suffix = spec[4:]
+                try:
+                    count = int(suffix)
+                except ValueError:
+                    count = 4
+                start = max(0, layer_count - count)
+                return list(range(start, layer_count))
+            if spec_lower.startswith("indices:"):
+                body = spec.split(":", 1)[1]
+                indices: List[int] = []
+                for item in body.split(","):
+                    item = item.strip()
+                    if item:
+                        try:
+                            indices.append(int(item))
+                        except ValueError:
+                            continue
+                return indices
+            return list(range(layer_count))
+
+        resolved_layers = resolve_layers(layers_for_scoring, max(all_layers) + 1)
+        resolved_layer_set = set(resolved_layers)
+        available_layers = [idx for idx in all_layers if idx in resolved_layer_set]
+        if not available_layers:
+            dprint("no layers selected after filtering")
+            return model, False
+
+        existing_initializers = {init.name for init in graph.initializer}
+        existing_outputs = {out.name for out in graph.output}
+
+        def ensure_initializer(name: str, values, dtype) -> str:
+            if name in existing_initializers:
+                return name
+            array = np.array(values, dtype=dtype)
+            tensor = numpy_helper.from_array(array, name)
+            graph.initializer.append(tensor)
+            existing_initializers.add(name)
+            return name
+
+        layer_mask_bias: Dict[int, Tuple[str, str]] = {}
+        for node in graph.node:
+            if node.op_type != "Softmax" or not node.output:
+                continue
+            output_name = node.output[0]
+            match = layer_pattern.search(output_name)
+            if not match:
+                continue
+            try:
+                layer_idx = int(match.group(1))
+            except ValueError:
+                continue
+            source_name = node.input[0]
+            where_node = node_by_output.get(source_name)
+            if where_node and where_node.op_type == "Where" and len(where_node.input) == 3:
+                mask_name, bias_name, _ = where_node.input
+                layer_mask_bias[layer_idx] = (mask_name, bias_name)
+
+        applied_layers: List[int] = []
+        per_layer_results: List[Tuple[int, str]] = []
+
+        for layer_idx in available_layers:
+            q_name = f"model/layers.{layer_idx}/self_attn/{q_last_suffix}"
+            k_name = f"model/layers.{layer_idx}/self_attn/{k_transpose_suffix}"
+
+            if q_name not in node_by_output or k_name not in node_by_output:
+                dprint(f"layer {layer_idx}: missing Q({q_name in node_by_output}) or K({k_name in node_by_output}) tap")
+                continue
+
+            applied_layers.append(layer_idx)
+
+            q_squeeze = f"model/layers.{layer_idx}/importance/Q_squeeze"
+            k_squeeze = f"model/layers.{layer_idx}/importance/K_squeeze"
+            graph.node.append(
+                helper.make_node("Squeeze", [q_name], [q_squeeze], name=q_squeeze, axes=[0])
+            )
+            graph.node.append(
+                helper.make_node("Squeeze", [k_name], [k_squeeze], name=k_squeeze, axes=[0])
+            )
+
+            k_transposed = f"model/layers.{layer_idx}/importance/K_transpose"
+            graph.node.append(
+                helper.make_node("Transpose", [k_squeeze], [k_transposed], name=k_transposed, perm=[0, 2, 1])
+            )
+
+            q_unsqueezed = f"model/layers.{layer_idx}/importance/Q_unsqueeze"
+            graph.node.append(
+                helper.make_node("Unsqueeze", [q_squeeze], [q_unsqueezed], name=q_unsqueezed, axes=[1])
+            )
+
+            q_heads = get_dim_value(q_name, 1)
+            q_dim = get_dim_value(q_name, 2)
+            k_heads = get_dim_value(k_name, 1)
+            factor = 1
+            if q_heads is not None and k_heads is not None:
+                if q_heads != k_heads:
+                    if q_heads % k_heads != 0:
+                        raise ValueError(
+                            f"ScoringHeadTransform: layer {layer_idx} incompatible head dims q={q_heads}, k={k_heads}"
+                        )
+                    factor = q_heads // k_heads
+            if factor > 1:
+                concat_inputs = [k_transposed] * factor
+                k_tiled = f"model/layers.{layer_idx}/importance/K_tiled"
+                graph.node.append(
+                    helper.make_node("Concat", concat_inputs, [k_tiled], name=k_tiled, axis=0)
+                )
+                matmul_k_input = k_tiled
+            else:
+                matmul_k_input = k_transposed
+
+            matmul = f"model/layers.{layer_idx}/importance/MatMul"
+            matmul_out = f"model/layers.{layer_idx}/importance/MatMul_out"
+            graph.node.append(helper.make_node("MatMul", [q_unsqueezed, matmul_k_input], [matmul_out], name=matmul))
+
+            logits = f"model/layers.{layer_idx}/importance/MatMul_squeezed"
+            graph.node.append(
+                helper.make_node("Squeeze", [matmul_out], [logits], name=logits, axes=[1])
+            )
+
+            if q_dim is not None and q_dim > 0:
+                scale_value = 1.0 / math.sqrt(float(q_dim))
+            else:
+                scale_value = 1.0
+            scale_const_name = f"model/layers.{layer_idx}/importance/scale_const"
+            ensure_initializer(scale_const_name, [scale_value], np_dtype)
+
+            scaled_logits = f"model/layers.{layer_idx}/importance/scaled"
+            graph.node.append(
+                helper.make_node("Mul", [logits, scale_const_name], [scaled_logits], name=scaled_logits)
+            )
+
+            masked_input = scaled_logits
+            if layer_idx in layer_mask_bias:
+                mask_name, bias_name = layer_mask_bias[layer_idx]
+                masked = f"model/layers.{layer_idx}/importance/masked"
+                graph.node.append(
+                    helper.make_node("Where", [mask_name, bias_name, scaled_logits], [masked], name=masked)
+                )
+                masked_input = masked
+
+            softmax = f"model/layers.{layer_idx}/importance/softmax"
+            graph.node.append(
+                helper.make_node("Softmax", [masked_input], [softmax], name=softmax, axis=1)
+            )
+
+            reduce_max = f"model/layers.{layer_idx}/importance/reduce_max"
+            reduce_output = f"model/layers.{layer_idx}/importance/heads_reduced"
+            graph.node.append(
+                helper.make_node("ReduceMax", [softmax], [reduce_output], name=reduce_max, axes=[0], keepdims=1)
+            )
+
+            final_tensor = reduce_output
+
+            if smoothing_window > 1:
+                reshape_in = f"model/layers.{layer_idx}/importance/reshape_in"
+                reshape_in_shape = f"model/layers.{layer_idx}/importance/reshape_in_shape"
+                ensure_initializer(reshape_in_shape, [1, 1, -1], np.int64)
+                graph.node.append(
+                    helper.make_node("Reshape", [final_tensor, reshape_in_shape], [reshape_in], name=reshape_in)
+                )
+
+                avg_pool = f"model/layers.{layer_idx}/importance/avg_pool"
+                pad = smoothing_window // 2
+                graph.node.append(
+                    helper.make_node(
+                        "AveragePool",
+                        [reshape_in],
+                        [avg_pool],
+                        name=avg_pool,
+                        kernel_shape=[smoothing_window],
+                        strides=[1],
+                        pads=[pad, pad],
+                    )
+                )
+
+                reshape_out = f"model/layers.{layer_idx}/importance/reshape_out"
+                reshape_out_shape = f"model/layers.{layer_idx}/importance/reshape_out_shape"
+                ensure_initializer(reshape_out_shape, [1, -1], np.int64)
+                graph.node.append(
+                    helper.make_node("Reshape", [avg_pool, reshape_out_shape], [reshape_out], name=reshape_out)
+                )
+                final_tensor = reshape_out
+
+            per_layer_results.append((layer_idx, final_tensor))
+
+            if not emit_single_output:
+                output_name = f"importance.layer{layer_idx}"
+                if output_name not in existing_outputs:
+                    vi = helper.make_tensor_value_info(output_name, dtype_enum, [1, "seq_len"])
+                    graph.output.append(vi)
+                    existing_outputs.add(output_name)
+                identity = f"model/layers.{layer_idx}/importance/output"
+                graph.node.append(
+                    helper.make_node("Identity", [final_tensor], [output_name], name=identity)
+                )
+
+        if not per_layer_results:
+            dprint("no layers processed successfully")
+            return model, False
+
+        if emit_single_output:
+            unsqueezed_tensors: List[str] = []
+            for layer_idx, tensor in per_layer_results:
+                unsq = f"model/layers.{layer_idx}/importance/unsqueeze_final"
+                graph.node.append(
+                    helper.make_node("Unsqueeze", [tensor], [unsq], name=unsq, axes=[1])
+                )
+                unsqueezed_tensors.append(unsq)
+
+            if len(unsqueezed_tensors) == 1:
+                concat_output = unsqueezed_tensors[0]
+            else:
+                concat = "model/importance/concat_layers"
+                concat_output = "model/importance/concat_layers_output"
+                graph.node.append(
+                    helper.make_node("Concat", unsqueezed_tensors, [concat_output], name=concat, axis=1)
+                )
+
+            reduce = "model/importance/reduce_layers"
+            importance_output = "importance"
+            graph.node.append(
+                helper.make_node("ReduceMax", [concat_output], [importance_output], name=reduce, axes=[1], keepdims=0)
+            )
+            if importance_output not in existing_outputs:
+                vi = helper.make_tensor_value_info(importance_output, dtype_enum, [1, "seq_len"])
+                graph.output.append(vi)
+                existing_outputs.add(importance_output)
+
+        try:
+            model = shape_inference.infer_shapes(model)
+        except Exception as exc:  # pragma: no cover - best effort
+            dprint(f"final shape inference skipped: {exc}")
+
+        dprint(
+            f"applied to layers {applied_layers}; emit_single_output={emit_single_output}; smoothing={smoothing_window}"
+        )
+
+        return model, True
 
