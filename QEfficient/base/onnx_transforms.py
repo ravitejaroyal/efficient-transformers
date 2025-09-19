@@ -80,29 +80,33 @@ class SplitTensorsTransform(OnnxTransform):
         *,
         model_name: str,
         onnx_base_dir: Optional[str] = None,
-        file_chunk_size: int = 10 * 2**30,  # 10 GiB
         size_threshold: int = 1024,
         **kwargs,
     ) -> Tuple[ModelProto, bool]:
         """
-        :param model_name: Used for naming external files. i.e. {model_name}_0.onnx.data
+        :param model_name: Used for naming external files (e.g., {model_name}.onnx.data)
         :param onnx_base_dir: Base directory to load tensors (if not already loaded).
-        :param file_chunk_size: Chunk size to split external files into.
-        :param size_threshold: Only tensors greater than this threshold (in bytes) will be saved externally.
+        :param size_threshold: Tensors strictly larger than this threshold (bytes) will be externalized.
         """
-        file_num = 0
-        current_file_size = 0
-        transformed = False
-        external_data_helper.load_external_data_for_model(model, onnx_base_dir)
-        for tensor in external_data_helper._get_all_tensors(model):
-            if tensor.HasField("raw_data") and ((tsize := len(tensor.raw_data)) > size_threshold):
-                transformed = True
-                current_file_size += tsize
-                if current_file_size > file_chunk_size:
-                    file_num += 1
-                    current_file_size = tsize
-                external_data_helper.set_external_data(tensor, f"{model_name}_{file_num}.onnx.data")
-        return model, transformed
+        # Ensure any existing externals are loaded to raw_data before conversion
+        try:
+            external_data_helper.load_external_data_for_model(model, onnx_base_dir)
+        except Exception:
+            pass
+        # Convert using the official helper; this does not destroy raw_data until save_model
+        try:
+            from onnx.external_data_helper import convert_model_to_external_data
+
+            convert_model_to_external_data(
+                model,
+                all_tensors_to_one_file=True,
+                location=f"{model_name}.onnx.data",
+                size_threshold=size_threshold,
+            )
+            return model, True
+        except Exception:
+            # If conversion fails, leave model as-is (embedded weights), no data loss.
+            return model, False
 
 
 class ScoringHeadTransform(OnnxTransform):
