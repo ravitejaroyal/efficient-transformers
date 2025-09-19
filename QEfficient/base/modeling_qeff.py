@@ -265,8 +265,6 @@ class QEFFBaseModel(ABC):
 
             # Save model with external data file next to the .onnx (always create one file)
             try:
-                import onnx
-
                 onnx.save_model(
                     model,
                     str(onnx_path),
