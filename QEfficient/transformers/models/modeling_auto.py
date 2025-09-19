@@ -1893,15 +1893,31 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         io_precision = "float32" if importance_dtype in {"float32", "fp32"} else "float16"
 
         if enable_scoring:
+            # Only add scoring outputs that actually exist in the exported ONNX
+            try:
+                import onnx
+
+                m = onnx.load(str(onnx_path))
+                model_outputs = {o.name for o in m.graph.output}
+            except Exception:
+                model_outputs = set()
+
+            added = []
             if emit_single:
-                custom_io["importance"] = io_precision
+                if "importance" in model_outputs:
+                    custom_io["importance"] = io_precision
+                    added.append("importance")
             else:
                 for idx in _resolve_layers_for_scoring(layers_spec, self.num_layers):
-                    custom_io[f"importance.layer{idx}"] = io_precision
-            print(
-                "[compile] scoring outputs:",
-                [key for key in custom_io.keys() if key.startswith("importance")],
-            )
+                    name = f"importance.layer{idx}"
+                    if name in model_outputs:
+                        custom_io[name] = io_precision
+                        added.append(name)
+
+            if added:
+                print("[compile] scoring outputs present in model:", added)
+            else:
+                print("[compile] scoring outputs: none found in ONNX; skipping custom_io for scoring")
 
         qpc_path = self._compile(
             onnx_path=onnx_path,
