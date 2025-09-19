@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import onnx
+from onnx import helper as onnx_helper
 import torch
 
 from QEfficient.base.onnx_transforms import OnnxTransform, ScoringHeadTransform
@@ -224,6 +225,29 @@ class QEFFBaseModel(ABC):
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
             )
+
+            # --- ensure modern IR and a valid default-domain opset before saving ---
+            try:
+                model.ir_version = onnx.IR_VERSION
+            except Exception:
+                pass
+            try:
+                # If opset_import is empty, add default-domain opset equal to export opset
+                if not list(model.opset_import):
+                    export_opset = getattr(constants, "ONNX_EXPORT_OPSET", 13)
+                    model.opset_import.extend([onnx_helper.make_operatorsetid("", export_opset)])
+            except Exception:
+                pass
+            if os.getenv("QEFF_SCORING_PROBE", "0") == "1":
+                try:
+                    print("[export][probe] IR:", getattr(model, "ir_version", None))
+                    print(
+                        "[export][probe] opset_import:",
+                        [(imp.domain or "", imp.version) for imp in model.opset_import],
+                    )
+                except Exception:
+                    pass
+
             onnx.save(model, onnx_path)
             print(f"[export] saved transformed onnx to {onnx_path}")
 
