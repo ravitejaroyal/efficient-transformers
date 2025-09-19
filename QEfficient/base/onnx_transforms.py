@@ -90,7 +90,9 @@ class SplitTensorsTransform(OnnxTransform):
         """
         # Ensure any existing externals are loaded to raw_data before conversion
         try:
-            external_data_helper.load_external_data_for_model(model, onnx_base_dir)
+            load_dir = kwargs.get("load_external_dir", onnx_base_dir)
+            if load_dir:
+                external_data_helper.load_external_data_for_model(model, load_dir)
         except Exception:
             pass
         # Convert using the official helper; this does not destroy raw_data until save_model
