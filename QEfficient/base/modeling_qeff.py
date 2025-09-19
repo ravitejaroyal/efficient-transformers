@@ -276,7 +276,6 @@ class QEFFBaseModel(ABC):
                     size_threshold=1024,
                 )
                 # Verify: non-trivial ONNX size OR sidecar present OR uses_external_data reported
-                import os
                 from onnx.external_data_helper import uses_external_data
 
                 onnx_bytes = os.path.getsize(onnx_path)
@@ -304,8 +303,6 @@ class QEFFBaseModel(ABC):
                     onnx.save(model, str(onnx_path))
                 # Optionally, re-verify size
                 try:
-                    import os
-
                     print(
                         f"[export] external save verification failed; wrote embedded weights. onnx_size={os.path.getsize(onnx_path)}"
                     )
