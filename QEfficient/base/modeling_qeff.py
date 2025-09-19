@@ -263,7 +263,30 @@ class QEFFBaseModel(ABC):
                 except Exception:
                     pass
 
-            onnx.save(model, onnx_path)
+            # Save model with external data file next to the .onnx (always create one file)
+            try:
+                import onnx
+
+                onnx.save_model(
+                    model,
+                    str(onnx_path),
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location=f"{self.model_name}.onnx.data",  # written in export_dir
+                    size_threshold=1024,  # small tensors inline; big tensors go to .data
+                )
+            except TypeError:
+                # Fallback for older onnx API (if save_model signature differs):
+                # Convert to external data first, then save
+                from onnx.external_data_helper import convert_model_to_external_data
+
+                convert_model_to_external_data(
+                    model,
+                    all_tensors_to_one_file=True,
+                    location=f"{self.model_name}.onnx.data",
+                    size_threshold=1024,
+                )
+                onnx.save_model(model, str(onnx_path))
             print(f"[export] saved transformed onnx to {onnx_path}")
 
         except Exception as e:
