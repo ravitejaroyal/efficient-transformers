@@ -6,6 +6,7 @@
 # ----------------------------------------------------------------------------
 
 import hashlib
+import os
 import warnings
 from pathlib import Path
 from time import perf_counter
@@ -58,6 +59,51 @@ from QEfficient.utils import (
 )
 from QEfficient.utils.cache import to_hashable
 from QEfficient.utils.logging_utils import logger
+
+
+def _resolve_layers_for_scoring(spec: str, layer_count: int) -> List[int]:
+    """Resolve textual layer selection specifiers into concrete layer indices."""
+
+    spec = (spec or "").strip()
+    lower = spec.lower()
+
+    if lower == "all":
+        candidates = list(range(layer_count))
+    elif lower.startswith("last"):
+        suffix = spec[4:]
+        try:
+            count = int(suffix)
+        except ValueError:
+            count = 4
+        start = max(0, layer_count - count)
+        candidates = list(range(start, layer_count))
+    elif lower.startswith("indices:"):
+        body = spec.split(":", 1)[1]
+        candidates = []
+        for item in body.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                candidates.append(int(item))
+            except ValueError:
+                continue
+    else:
+        candidates = list(range(layer_count))
+
+    resolved: List[int] = []
+    seen = set()
+    for idx in candidates:
+        if not isinstance(idx, int):
+            continue
+        if idx < 0 or idx >= layer_count:
+            continue
+        if idx in seen:
+            continue
+        resolved.append(idx)
+        seen.add(idx)
+
+    return resolved
 
 
 class QEFFTransformersBase(QEFFBaseModel):
@@ -1839,6 +1885,23 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             for i in range(self.num_layers):
                 for kv in ["key", "value"]:
                     custom_io[f"past_{kv}.{i}{suffix}"] = kv_cache_dtype
+
+        enable_scoring = os.getenv("QEFF_SCORING_ENABLE", "0") == "1"
+        emit_single = os.getenv("QEFF_SCORING_SINGLE", "0") == "1"
+        layers_spec = os.getenv("QEFF_SCORING_LAYERS", "all")
+        importance_dtype = os.getenv("QEFF_SCORING_DTYPE", "float16").lower()
+        io_precision = "float32" if importance_dtype in {"float32", "fp32"} else "float16"
+
+        if enable_scoring:
+            if emit_single:
+                custom_io["importance"] = io_precision
+            else:
+                for idx in _resolve_layers_for_scoring(layers_spec, self.num_layers):
+                    custom_io[f"importance.layer{idx}"] = io_precision
+            print(
+                "[compile] scoring outputs:",
+                [key for key in custom_io.keys() if key.startswith("importance")],
+            )
 
         qpc_path = self._compile(
             onnx_path=onnx_path,

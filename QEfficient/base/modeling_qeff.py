@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import onnx
 import torch
 
-from QEfficient.base.onnx_transforms import OnnxTransform
+from QEfficient.base.onnx_transforms import OnnxTransform, ScoringHeadTransform
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
 from QEfficient.generation.cloud_infer import QAICInferenceSession
@@ -200,6 +200,26 @@ class QEFFBaseModel(ABC):
             for tclass in transforms:
                 print(f"[export] applying transform: {tclass.__name__}")
                 model, transformed = tclass.apply(model, **transform_kwargs)
+
+            enable_scoring = False
+            if onnx_transform_kwargs and onnx_transform_kwargs.get("enable_scoring_head", False):
+                enable_scoring = True
+            elif os.getenv("QEFF_SCORING_ENABLE", "0") == "1":
+                enable_scoring = True
+
+            if enable_scoring:
+                sh_cfg = {
+                    "layers_for_scoring": os.getenv("QEFF_SCORING_LAYERS", "all"),
+                    "emit_single_output": os.getenv("QEFF_SCORING_SINGLE", "0") == "1",
+                    "importance_dtype": os.getenv("QEFF_SCORING_DTYPE", "float16"),
+                    "smoothing_window": int(os.getenv("QEFF_SCORING_SMOOTH", "3")),
+                }
+                scoring_kwargs = dict(transform_kwargs)
+                scoring_kwargs.update(sh_cfg)
+                model, scoring_transformed = ScoringHeadTransform.apply(model, **scoring_kwargs)
+                print(
+                    f"[export] ScoringHeadTransform applied: transformed={scoring_transformed} cfg={sh_cfg}"
+                )
 
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
