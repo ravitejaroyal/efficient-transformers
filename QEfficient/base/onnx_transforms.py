@@ -291,9 +291,10 @@ class ScoringHeadTransform(OnnxTransform):
                 helper.make_node("Unsqueeze", [q_squeeze], [q_unsqueezed], name=q_unsqueezed, axes=[1])
             )
 
-            q_heads = get_dim_value(q_name, 1)
-            q_dim = get_dim_value(q_name, 2)
-            k_heads = get_dim_value(k_name, 1)
+            q_heads = get_dim_value(q_name, 1)   # Q: [1,H,D]
+            q_dim   = get_dim_value(q_name, 2)   # D from Q if shape info present
+            k_heads = get_dim_value(k_name, 1)   # K: [1,H_kv,S,D]
+            k_dim   = get_dim_value(k_name, 3)   # D from K if Q dim missing
             factor = 1
             if q_heads is not None and k_heads is not None:
                 if q_heads != k_heads:
@@ -303,7 +304,12 @@ class ScoringHeadTransform(OnnxTransform):
                         )
                     factor = q_heads // k_heads
             if factor > 1:
-                concat_inputs = [k_transposed] * factor
+                # replicate K along head dim using distinct inputs for Concat
+                concat_inputs = []
+                for t in range(factor):
+                    k_copy = f"model/layers.{layer_idx}/importance/K_copy{t}"
+                    graph.node.append(helper.make_node("Identity", [k_transposed], [k_copy], name=k_copy))
+                    concat_inputs.append(k_copy)
                 k_tiled = f"model/layers.{layer_idx}/importance/K_tiled"
                 graph.node.append(
                     helper.make_node("Concat", concat_inputs, [k_tiled], name=k_tiled, axis=0)
@@ -321,10 +327,16 @@ class ScoringHeadTransform(OnnxTransform):
                 helper.make_node("Squeeze", [matmul_out], [logits], name=logits, axes=[1])
             )
 
+            # derive D from Q first; if missing, fall back to K's last dim
+            D = None
             if q_dim is not None and q_dim > 0:
-                scale_value = 1.0 / math.sqrt(float(q_dim))
-            else:
-                scale_value = 1.0
+                D = int(q_dim)
+            elif k_dim is not None and k_dim > 0:
+                D = int(k_dim)
+            # If D is still unknown, keep a safe assert; we prefer failing fast to wrong scaling
+            if D is None or D <= 0:
+                raise ValueError(f"ScoringHeadTransform: cannot derive head dim D for layer {layer_idx}")
+            scale_value = 1.0 / math.sqrt(float(D))
             scale_const_name = f"model/layers.{layer_idx}/importance/scale_const"
             ensure_initializer(scale_const_name, [scale_value], np_dtype)
 
@@ -336,10 +348,15 @@ class ScoringHeadTransform(OnnxTransform):
             masked_input = scaled_logits
             if layer_idx in layer_mask_bias:
                 mask_name, bias_name = layer_mask_bias[layer_idx]
+                # reshape mask/bias to [1,S] so they broadcast to [H,S]
+                shape_1S = f"model/layers.{layer_idx}/importance/shape_1S"
+                ensure_initializer(shape_1S, [1, -1], np.int64)
+                mask_1S = f"model/layers.{layer_idx}/importance/mask_1S"
+                bias_1S = f"model/layers.{layer_idx}/importance/bias_1S"
+                graph.node.append(helper.make_node("Reshape", [mask_name, shape_1S], [mask_1S], name=mask_1S))
+                graph.node.append(helper.make_node("Reshape", [bias_name, shape_1S], [bias_1S], name=bias_1S))
                 masked = f"model/layers.{layer_idx}/importance/masked"
-                graph.node.append(
-                    helper.make_node("Where", [mask_name, bias_name, scaled_logits], [masked], name=masked)
-                )
+                graph.node.append(helper.make_node("Where", [mask_1S, bias_1S, scaled_logits], [masked], name=masked))
                 masked_input = masked
 
             softmax = f"model/layers.{layer_idx}/importance/softmax"
@@ -364,7 +381,7 @@ class ScoringHeadTransform(OnnxTransform):
                 )
 
                 avg_pool = f"model/layers.{layer_idx}/importance/avg_pool"
-                pad = smoothing_window // 2
+                pad = smoothing_window // 2   # pads=[pad_left, pad_right] for 1D
                 graph.node.append(
                     helper.make_node(
                         "AveragePool",
