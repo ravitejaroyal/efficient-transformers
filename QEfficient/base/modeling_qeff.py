@@ -188,9 +188,11 @@ class QEFFBaseModel(ABC):
             )
             logger.info("Pytorch export successful")
 
-            model = onnx.load(tmp_onnx_path, load_external_data=False)
+            # Load with external data so weight tensors are present in memory
+            model = onnx.load(tmp_onnx_path, load_external_data=True)
+            # IMPORTANT: point transforms that create external data at the FINAL export_dir
             transform_kwargs = {
-                "onnx_base_dir": str(tmp_onnx_dir),
+                "onnx_base_dir": str(export_dir),
                 "model_name": self.model_name,
             }
             if onnx_transform_kwargs is not None:
@@ -236,6 +238,19 @@ class QEFFBaseModel(ABC):
                 if not list(model.opset_import):
                     export_opset = getattr(constants, "ONNX_EXPORT_OPSET", 13)
                     model.opset_import.extend([onnx_helper.make_operatorsetid("", export_opset)])
+            except Exception:
+                pass
+
+            # --- rebase/write external data next to the final ONNX ---
+            try:
+                from onnx.external_data_helper import convert_model_to_external_data
+
+                convert_model_to_external_data(
+                    model,
+                    all_tensors_to_one_file=True,
+                    location=f"{self.model_name}.onnx.data",  # saved in export_dir
+                    size_threshold=1024,  # keep small tensors inline
+                )
             except Exception:
                 pass
             if os.getenv("QEFF_SCORING_PROBE", "0") == "1":
