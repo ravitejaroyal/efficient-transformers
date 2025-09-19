@@ -52,6 +52,11 @@ def main() -> None:
         help="Number of decode anchors for look-ahead (default: 0).",
     )
     parser.add_argument(
+        "--prefer-device-importance",
+        action="store_true",
+        help="Prefer on-device importance (when compiled/enabled) and skip host scoring for look_ahead==0.",
+    )
+    parser.add_argument(
         "--layers-for-scoring",
         default="all",
         choices=["all", "last4", "last1"],
@@ -177,6 +182,7 @@ def main() -> None:
         layers_sel=args.layers_for_scoring,
         gen_len=int(args.gen_len) if args.gen_len is not None else None,
         look_ahead=int(args.look_ahead),
+        prefer_device_importance=bool(args.prefer_device_importance),
     )
 
     # --- Pretty, accurate TTFT breakdown ---
