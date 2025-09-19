@@ -215,10 +215,11 @@ class QEFFBaseModel(ABC):
                 self.onnx_path = final_onnx
                 return final_onnx
 
-            # IMPORTANT: point transforms that create external data at the FINAL export_dir
+            # IMPORTANT:
+            # - load existing external tensors from TMP (where torch.onnx.export wrote them),
+            # - transforms can still WRITE externals into export_dir later if desired.
             transform_kwargs = {
-                "onnx_base_dir": str(export_dir),
-                "load_external_dir": str(tmp_onnx_dir),
+                "onnx_base_dir": str(tmp_onnx_dir),  # use TEMP dir as the load base for external_data
                 "model_name": self.model_name,
             }
             if onnx_transform_kwargs is not None:
@@ -267,16 +268,17 @@ class QEFFBaseModel(ABC):
             except Exception:
                 pass
 
-            # --- prepare external data metadata (best effort) ---
+            # If split transform already externalized tensors, do not re-convert; otherwise convert once.
             try:
                 from onnx.external_data_helper import convert_model_to_external_data
-
-                convert_model_to_external_data(
-                    model,
-                    all_tensors_to_one_file=True,
-                    location=f"{self.model_name}.onnx.data",  # saved in export_dir
-                    size_threshold=1024,  # keep small tensors inline; big tensors external
-                )
+                already_external = any(t.external_data for t in model.graph.initializer)
+                if not already_external:
+                    convert_model_to_external_data(
+                        model,
+                        all_tensors_to_one_file=True,
+                        location=f"{self.model_name}.onnx.data",
+                        size_threshold=1024,
+                    )
             except Exception:
                 pass
             if os.getenv("QEFF_SCORING_PROBE", "0") == "1":
@@ -289,51 +291,31 @@ class QEFFBaseModel(ABC):
                 except Exception:
                     pass
 
-            # Save model with external data (single sidecar) and VERIFY outcome.
-            sidecar = export_dir / f"{self.model_name}.onnx.data"
-            saved_ok = False
+            # Save respecting existing external-data pointers:
+            #  - If tensors have external_data entries (from split), preserve them (multi-chunk).
+            #  - Otherwise, emit a single sidecar file with all weights.
             try:
-                onnx.save_model(
-                    model,
-                    str(onnx_path),
-                    save_as_external_data=True,
-                    all_tensors_to_one_file=True,
-                    location=sidecar.name,
-                    size_threshold=1024,
-                )
-                # Verify: non-trivial ONNX size OR sidecar present OR uses_external_data reported
-                from onnx.external_data_helper import uses_external_data
-
-                onnx_bytes = os.path.getsize(onnx_path)
-                uses_ext = False
-                try:
-                    m_chk = onnx.load(str(onnx_path), load_external_data=False)
-                    uses_ext = uses_external_data(m_chk)
-                except Exception:
-                    pass
-                if (onnx_bytes > 1_000_000) or sidecar.exists() or uses_ext:
-                    saved_ok = True
-            except TypeError:
-                # Older onnx API fallback
-                try:
-                    onnx.save_model(model, str(onnx_path))
-                    saved_ok = (export_dir / self.model_name).exists()  # coarse
-                except Exception:
-                    saved_ok = False
-
-            if not saved_ok:
-                # Fallback: embed weights to ensure a valid, non-trivial ONNX (no sidecar)
-                try:
-                    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
-                except TypeError:
-                    onnx.save(model, str(onnx_path))
-                # Optionally, re-verify size
-                try:
-                    print(
-                        f"[export] external save verification failed; wrote embedded weights. onnx_size={os.path.getsize(onnx_path)}"
+                already_external = any(t.external_data for t in model.graph.initializer)
+                if already_external:
+                    onnx.save_model(
+                        model,
+                        str(onnx_path),
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=False,  # respect existing per-tensor locations
+                        size_threshold=1024,
                     )
-                except Exception:
-                    pass
+                else:
+                    onnx.save_model(
+                        model,
+                        str(onnx_path),
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=True,
+                        location=f"{self.model_name}.onnx.data",
+                        size_threshold=1024,
+                    )
+            except TypeError:
+                # Minimal backward-compat fallback
+                onnx.save_model(model, str(onnx_path))
 
             print(f"[export] saved transformed onnx to {onnx_path}")
 
