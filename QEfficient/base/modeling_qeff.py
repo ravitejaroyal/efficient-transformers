@@ -188,11 +188,32 @@ class QEFFBaseModel(ABC):
             )
             logger.info("Pytorch export successful")
 
-            # Load with external data so weight tensors are present in memory
+            # Load ONNX with external data and ensure tensors are materialized from tmp
             model = onnx.load(tmp_onnx_path, load_external_data=True)
+            try:
+                from onnx import external_data_helper as edh
+
+                edh.load_external_data_for_model(model, str(tmp_onnx_dir))
+            except Exception as e:
+                print(f"[export][probe] load_external_data_for_model failed: {e}")
+
+            # Guard against hollow models (no raw_data available) before saving
+            try:
+                has_bytes = any(
+                    tensor.HasField("raw_data") and len(tensor.raw_data) > 0
+                    for tensor in model.graph.initializer
+                )
+                if not has_bytes:
+                    raise RuntimeError(
+                        "[export] No raw_data in initializers after loading externals from tmp; refusing to save a hollow ONNX."
+                    )
+            except Exception:
+                pass
+
             # IMPORTANT: point transforms that create external data at the FINAL export_dir
             transform_kwargs = {
                 "onnx_base_dir": str(export_dir),
+                "load_external_dir": str(tmp_onnx_dir),
                 "model_name": self.model_name,
             }
             if onnx_transform_kwargs is not None:
