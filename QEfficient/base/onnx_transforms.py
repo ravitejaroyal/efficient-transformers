@@ -111,10 +111,17 @@ class ScoringHeadTransform(OnnxTransform):
     @classmethod
     def apply(cls, model: ModelProto, **cfg) -> Tuple[ModelProto, bool]:
         debug_enabled = os.getenv("QEFF_SCORING_DEBUG", "0") == "1"
+        probe_enabled = os.getenv("QEFF_SCORING_PROBE", "0") == "1"
 
         def dprint(*args):
             if debug_enabled:
                 print("[ScoringHeadTransform]", *args)
+
+        def pprint_shape(name: str, shapes: Dict[str, List[Optional[int]]]) -> str:
+            dims = shapes.get(name, None)
+            if not dims:
+                return "[]"
+            return "[" + ",".join(str(x) for x in dims) + "]"
 
         layers_for_scoring = str(cfg.get("layers_for_scoring", "all"))
         emit_single_output = bool(cfg.get("emit_single_output", False))
@@ -137,6 +144,19 @@ class ScoringHeadTransform(OnnxTransform):
             model = shape_inference.infer_shapes(model)
         except Exception as exc:  # pragma: no cover - best effort
             dprint(f"initial shape inference skipped: {exc}")
+
+        if probe_enabled:
+            try:
+                # IR / opset imports summary
+                import onnx
+
+                print("[ScoringHeadTransform][PROBE] IR:", getattr(model, "ir_version", None))
+                print(
+                    "[ScoringHeadTransform][PROBE] opset_import:",
+                    [(imp.domain or "", imp.version) for imp in model.opset_import],
+                )
+            except Exception as _:
+                pass
 
         graph = model.graph
         node_by_output = {}
@@ -228,6 +248,54 @@ class ScoringHeadTransform(OnnxTransform):
         if not available_layers:
             dprint("no layers selected after filtering")
             return model, False
+
+        if probe_enabled:
+            # Probe: print candidates for first few available layers
+            max_probe = int(os.getenv("QEFF_SCORING_PROBE_LAYERS", "4"))
+            print(
+                f"[ScoringHeadTransform][PROBE] examining up to {max_probe} layers out of {len(available_layers)}"
+            )
+            # Build a map from output name -> node for quick lookup
+            node_by_output = {}
+            for n in graph.node:
+                for o in n.output:
+                    node_by_output[o] = n
+            for li in available_layers[:max_probe]:
+                prefix = f"model/layers.{li}/self_attn/"
+                # Gather all outputs under this layer's self_attn scope
+                cand_transpose = []
+                cand_gather = []
+                cand_softmax = []
+                for n in graph.node:
+                    for o in n.output:
+                        if o.startswith(prefix):
+                            if n.op_type == "Transpose":
+                                cand_transpose.append(o)
+                            elif n.op_type == "Gather":
+                                cand_gather.append(o)
+                            elif n.op_type == "Softmax":
+                                cand_softmax.append(o)
+                print(f"[PROBE][layer {li}] TRANSPOSE outputs:")
+                for o in cand_transpose:
+                    print("   ", o, pprint_shape(o, shape_dict))
+                print(f"[PROBE][layer {li}] GATHER outputs:")
+                for o in cand_gather:
+                    print("   ", o, pprint_shape(o, shape_dict))
+                # Mask/Where path that feeds Softmax
+                # Find Softmax in this layer and track its input
+                for so in cand_softmax:
+                    sm_node = node_by_output.get(so, None)
+                    src = sm_node.input[0] if sm_node and sm_node.input else None
+                    wn = node_by_output.get(src, None)
+                    print(
+                        f"[PROBE][layer {li}] Softmax: {so}  in: {src}  producer:",
+                        (wn.op_type if wn else None),
+                    )
+                    if wn and wn.op_type == "Where":
+                        print(f"[PROBE][layer {li}] Where inputs: {wn.input}")
+                        # print shapes for where inputs
+                        for inp in wn.input:
+                            print("    ", inp, pprint_shape(inp, shape_dict))
 
         existing_initializers = {init.name for init in graph.initializer}
         existing_outputs = {out.name for out in graph.output}
