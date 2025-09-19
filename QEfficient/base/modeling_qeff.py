@@ -188,7 +188,7 @@ class QEFFBaseModel(ABC):
             )
             logger.info("Pytorch export successful")
 
-            # Load ONNX with external data and ensure tensors are materialized from tmp
+            # Load ONNX and ensure all external tensor data is brought into raw_data from TMP
             model = onnx.load(tmp_onnx_path, load_external_data=True)
             try:
                 from onnx import external_data_helper as edh
@@ -197,18 +197,23 @@ class QEFFBaseModel(ABC):
             except Exception as e:
                 print(f"[export][probe] load_external_data_for_model failed: {e}")
 
-            # Guard against hollow models (no raw_data available) before saving
+            # Fail-safe guard: if no initializer has raw_data bytes, do NOT re-save; publish exporter artifacts.
             try:
                 has_bytes = any(
-                    tensor.HasField("raw_data") and len(tensor.raw_data) > 0
-                    for tensor in model.graph.initializer
+                    t.HasField("raw_data") and len(t.raw_data) > 0 for t in model.graph.initializer
                 )
-                if not has_bytes:
-                    raise RuntimeError(
-                        "[export] No raw_data in initializers after loading externals from tmp; refusing to save a hollow ONNX."
-                    )
             except Exception:
-                pass
+                has_bytes = False
+            if not has_bytes:
+                # Publish the original tmp ONNX + any sidecar files into export_dir and return
+                export_dir.mkdir(parents=True, exist_ok=True)
+                for p in tmp_onnx_dir.iterdir():
+                    # copy all files created by torch.onnx.export (e.g., .onnx and .onnx.data)
+                    shutil.copy2(p, export_dir / p.name)
+                final_onnx = export_dir / f"{self.model_name}.onnx"
+                print(f"[export] weights not in memory; using exporter artifact {final_onnx}")
+                self.onnx_path = final_onnx
+                return final_onnx
 
             # IMPORTANT: point transforms that create external data at the FINAL export_dir
             transform_kwargs = {
