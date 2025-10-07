@@ -50,8 +50,6 @@ class SpecPrefillEngine:
         # optional look-ahead anchors (default: disabled)
         self._look_ahead = 0
         self._last_outputs = None
-        self._prefer_device_importance = False
-        self._device_importance_available = False
 
         # Load QPC
         self._session = QAICInferenceSession(
@@ -298,16 +296,6 @@ class SpecPrefillEngine:
             f"past_key.{li}_RetainedState" for li in present_layers if li not in keep_set
         ]
 
-        device_imp_names = [
-            n for n in self._session.output_names if n == "importance" or n.startswith("importance.")
-        ]
-        self._device_importance_available = bool(device_imp_names)
-        prefer_device_now = (
-            bool(getattr(self, "_prefer_device_importance", False))
-            and getattr(self, "_look_ahead", 0) == 0
-            and self._device_importance_available
-        )
-
         # Skip now; kept bindings will be re-enabled on the final chunk
         if skip_bindings:
             self._session.skip_buffers(skip_bindings)
@@ -355,7 +343,7 @@ class SpecPrefillEngine:
             # Enable heavy outputs only for the final chunk: retained-state keys (prefill_queries stays bound)
             if last:
                 names_to_enable: List[str] = []
-                if keep_bindings and not prefer_device_now:
+                if keep_bindings:
                     names_to_enable += keep_bindings
                 if names_to_enable:
                     e0 = time.perf_counter()
@@ -450,19 +438,15 @@ class SpecPrefillEngine:
         if not self._kept_layers:
             raise RuntimeError("[spec] kept_layers is empty; cannot harvest retained-state keys.")
 
-        chunks_keys: Optional[List[List[np.ndarray]]]
-        if prefer_device_now:
-            chunks_keys = None
-        else:
-            # Harvest *retained-state* keys *once* from the final chunk (full ctx_len per layer), for kept layers
-            per_layer_keys_last = []
-            for li in self._kept_layers:
-                key_name = f"past_key.{li}_RetainedState"
-                if key_name not in outputs_last:
-                    raise RuntimeError(f"{key_name} missing in last-chunk outputs")
-                per_layer_keys_last.append(outputs_last[key_name])  # [1,H_kv,ctx_len,D]
-            # Store as a single "chunk" (we'll slice to S_total later)
-            chunks_keys = [per_layer_keys_last]
+        # Harvest *retained-state* keys *once* from the final chunk (full ctx_len per layer), for kept layers
+        per_layer_keys_last = []
+        for li in self._kept_layers:
+            key_name = f"past_key.{li}_RetainedState"
+            if key_name not in outputs_last:
+                raise RuntimeError(f"{key_name} missing in last-chunk outputs")
+            per_layer_keys_last.append(outputs_last[key_name])  # [1,H_kv,ctx_len,D]
+        # Store as a single "chunk" (we'll slice to S_total later)
+        chunks_keys: List[List[np.ndarray]] = [per_layer_keys_last]
 
         # store cache for host scoring
         self._prefill_cache = {
@@ -855,6 +839,7 @@ class SpecPrefillEngine:
                 smooth_window=None,
             )
             acc.append(imp.astype(np.float32, copy=False))
+
         importance = np.mean(np.stack(acc, axis=0), axis=0, dtype=np.float32)
         if smooth_window and smooth_window > 1:
             w = max(1, min(int(smooth_window), importance.shape[0]))
@@ -1021,78 +1006,26 @@ class SpecPrefillEngine:
             Q_final = Q_final[self._kept_layers, :, :]
         diag = {}
 
-        importance: Optional[np.ndarray] = None
-        pos_global: Optional[np.ndarray] = None
-        ids_global: Optional[np.ndarray] = None
-        S_total: Optional[int] = None
+        if chunks_keys is None:
+            raise RuntimeError(
+                "Retained-state keys missing; ensure QPC exports past_key.*_RetainedState"
+            )
 
-        use_device_imp = (
-            bool(getattr(self, "_prefer_device_importance", False))
-            and getattr(self, "_look_ahead", 0) == 0
-            and bool(outputs_last)
-            and bool(getattr(self, "_device_importance_available", False))
+        K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
+            chunks_keys, chunks_pos, chunks_ids
         )
+        t2 = time.perf_counter()
 
-        if use_device_imp and outputs_last is not None:
-            device_vec = outputs_last.get("importance") if isinstance(outputs_last, dict) else None
-            per_layer = []
-            if isinstance(outputs_last, dict):
-                for name, arr in outputs_last.items():
-                    if name.startswith("importance.layer"):
-                        per_layer.append(arr)
-            if device_vec is not None:
-                arr = np.asarray(device_vec)
-                importance = arr.reshape(-1).astype(np.float32, copy=False)
-            elif per_layer:
-                stack = [np.asarray(x).reshape(-1).astype(np.float32, copy=False) for x in per_layer]
-                importance = np.max(np.stack(stack, axis=0), axis=0).astype(np.float32, copy=False)
-            if importance is not None:
-                pos_global, ids_global, S_total = self._assemble_pos_ids_only(chunks_pos, chunks_ids)
-                t2 = t1
-                t3 = t1
-            else:
-                use_device_imp = False
-
-        if not use_device_imp:
-            if chunks_keys is None:
-                saved_flag = getattr(self, "_prefer_device_importance", False)
-                self._prefill_cache = None
-                try:
-                    self._prefer_device_importance = False
-                    _ = self.run_prefill(prompt, generation_len=None, prefill_logit_bs=1)
-                finally:
-                    self._prefer_device_importance = saved_flag
-                if self._prefill_cache is None:
-                    raise RuntimeError(
-                        "Failed to rebuild prefill cache for host scoring fallback"
-                    )
-                t1 = time.perf_counter()
-                chunks_keys = self._prefill_cache.get("chunks_keys")
-                chunks_pos = self._prefill_cache["chunks_pos"]
-                chunks_ids = self._prefill_cache["chunks_ids"]
-                outputs_last = self._prefill_cache.get("outputs_last")
-                Q_final = self._prefill_cache["Q_final"]
-                if self._kept_layers:
-                    Q_final = Q_final[self._kept_layers, :, :]
-                if chunks_keys is None:
-                    raise RuntimeError(
-                        "Host scoring fallback still missing retained-state keys; ensure QPC exports past_key.*_RetainedState"
-                    )
-            K_global, pos_global, ids_global, S_total, H_kv, D = self._assemble_global_keys(
-                chunks_keys, chunks_pos, chunks_ids
-            )
-            t2 = time.perf_counter()
-
-            Q_anchors = self._collect_anchor_queries(getattr(self, "_look_ahead", 0), S_total)
-            importance, diag = self._score_importance_multi_anchor(
-                K_global,
-                Q_anchors,
-                pos_global,
-                layers_sel=layers_sel,
-                agg_heads="max",
-                smooth_window=pool_kernel_size if pool_kernel_size and pool_kernel_size > 1 else None,
-            )
-            t3 = time.perf_counter()
+        Q_anchors = self._collect_anchor_queries(getattr(self, "_look_ahead", 0), S_total)
+        importance = self._score_importance_multi_anchor(
+            K_global,
+            Q_anchors,
+            pos_global,
+            layers_sel=layers_sel,
+            agg_heads="max",
+            smooth_window=pool_kernel_size if pool_kernel_size and pool_kernel_size > 1 else None,
+        )
+        t3 = time.perf_counter()
 
         if os.getenv("QEFF_SPEC_ASSERT", ""):
             print(f"[spec:diag] softmax_sum_l0h0={diag.get('softmax_sum_l0h0', None)}")
@@ -1140,12 +1073,8 @@ class SpecPrefillEngine:
 
         # collect timing diagnostics for caller
         t_run_prefill_s = t1 - t0
-        if use_device_imp:
-            t_assemble_s = 0.0
-            t_score_s = 0.0
-        else:
-            t_assemble_s = t2 - t1
-            t_score_s = t3 - t2
+        t_assemble_s = t2 - t1
+        t_score_s = t3 - t2
         t_select_s = t4 - t3
 
         if os.getenv("QEFF_SPEC_DEBUG", ""):
@@ -1177,11 +1106,7 @@ class SpecPrefillEngine:
             "S": S_total,
             "shapes": {
                 "prefill_queries": tuple(Q_final.shape),
-                **(
-                    {"first_key": tuple(K_global[0].shape)}
-                    if not use_device_imp
-                    else {}
-                ),
+                "first_key": tuple(K_global[0].shape),
             },
             "ids_global": ids_global,  # [S_total] int64 (exact device-fed tokens)
             # timing breakdown
@@ -1202,7 +1127,6 @@ class SpecPrefillEngine:
         layers_sel: str = "all",
         gen_len: Optional[int] = None,
         look_ahead: Optional[int] = None,
-        prefer_device_importance: bool = False,
     ) -> Dict[str, Any]:
         """
         Step 4.3: spec prefill+score -> build pruned ids/pos -> run base prefill
@@ -1210,7 +1134,6 @@ class SpecPrefillEngine:
         """
         # Persist look-ahead for downstream helpers (defaults to 0 if absent)
         self._look_ahead = int(look_ahead) if look_ahead is not None else 0
-        self._prefer_device_importance = bool(prefer_device_importance)
         # ---- TTFT(spec_only): spec prefill + score + select ----
         res = self.prefill_and_score(
             prompt,
@@ -1428,7 +1351,7 @@ def main() -> None:
     print(
         f"[score] S={S} kept={len(keep_idx)} ({kept_pct:.1f}%) "
         f"prefill_queries={shapes.get('prefill_queries')} "
-        f"first_key={shapes.get('first_key', 'device_importance')} "
+        f"first_key={shapes.get('first_key', 'unavailable')} "
         f"last_kept={keep_idx[-1] if keep_idx.size else 'NA'}"
     )
 
