@@ -842,8 +842,6 @@ class QEffTextGenerationBase:
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
-        # one-time probe flag for importance shape in decode
-        _printed_decode_imp = getattr(self, "_printed_decode_imp", False)
         num_token = 0
         for num_token in range(1, generation_len):
             if streamer:
