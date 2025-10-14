@@ -6,6 +6,7 @@ import time
 from typing import List, Optional
 
 import numpy as np
+import evaluate  # <-- added for ROUGE
 
 from QEfficient.generation.base_infer import TextGeneration
 from QEfficient.generation.spec_prefill import KeepConfig, SpecPrefillEngine
@@ -82,6 +83,13 @@ def main() -> None:
         default=None,
         help="If set, save the pruned-path base decode text to this file.",
     )
+    # Optional references file for ROUGE scoring (one line per prompt)
+    parser.add_argument(
+        "--refs-file",
+        type=str,
+        default=None,
+        help="Optional: path to a text file with one reference per line, aligned with --prompt-file or the single --prompt.",
+    )
     args = parser.parse_args()
 
     # ---- Parse device lists (accepts "[0,1]" or "0,1" or "[0]") ----
@@ -105,6 +113,17 @@ def main() -> None:
     else:
         # prompt_text = args.prompt
         prompts = [args.prompt]
+
+    # Optional references aligned with prompts
+    refs: Optional[List[str]] = None
+    if args.refs_file:
+        try:
+            with open(args.refs_file, "r", encoding="utf-8") as rf:
+                refs = [line.strip() for line in rf]
+        except Exception as e:
+            print(f"[ROUGE] warning: failed to read --refs-file ({e}); skipping ROUGE.")
+            refs = None
+
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
         qpc_path=args.spec_qpc,
@@ -147,7 +166,11 @@ def main() -> None:
         chunk_size=int(args.chunk_size),
     )
     # --- compute prompt length S once for gating ---
-    for prompt_text in prompts:
+    # Collect predictions and aligned references for optional ROUGE scoring
+    preds: List[str] = []
+    aligned_refs: List[str] = []
+
+    for idx, prompt_text in enumerate(prompts):
         enc_for_len = tokenizer(prompt_text, return_tensors="np")
         S = int(enc_for_len["input_ids"].shape[1])
         p = float(args.keep_percentage)
@@ -205,6 +228,11 @@ def main() -> None:
         # --- Optional: print/save pruned-path base decode output for verification ---
         gen_txt = ret.get("generated_text_pruned", None)
         if gen_txt is not None:
+            # Collect prediction for ROUGE (if references provided)
+            preds.append(gen_txt.strip())
+            if refs is not None and idx < len(refs):
+                aligned_refs.append(refs[idx])
+
             if args.print_pruned_output:
                 # Print a trimmed preview (avoid flooding console on long outputs)
                 preview = gen_txt if len(gen_txt) <= 400 else (gen_txt[:400] + " …")
@@ -221,7 +249,31 @@ def main() -> None:
             if args.print_pruned_output or args.save_pruned_output:
                 print("[pruned:base:output] no generated_text_pruned present; ensure --gen-len > 0 was passed through.")
 
+    # ---- Optional ROUGE scoring (only if aligned references are provided) ----
+    try:
+        if aligned_refs and len(preds) == len(aligned_refs):
+            rouge = evaluate.load("rouge")
+            scores = rouge.compute(
+                predictions=preds,
+                references=aligned_refs,
+                rouge_types=["rouge1", "rouge2", "rougeL", "rougeLsum"],
+            )
+            print("\n[ROUGE] results over {} example(s):".format(len(preds)))
+            print(
+                "  rouge1={:.4f}  rouge2={:.4f}  rougeL={:.4f}  rougeLsum={:.4f}".format(
+                    scores.get("rouge1", 0.0),
+                    scores.get("rouge2", 0.0),
+                    scores.get("rougeL", 0.0),
+                    scores.get("rougeLsum", 0.0),
+                )
+            )
+        elif args.refs_file:
+            # If refs were requested but counts mismatch, be explicit
+            n_refs = 0 if not refs else len(refs)
+            print(f"[ROUGE] warning: could not compute ROUGE (preds={len(preds)} vs refs={n_refs}).")
+    except Exception as e:
+        print(f"[ROUGE] warning: failed to compute ROUGE ({e}).")
+
 
 if __name__ == "__main__":
     main()
-
