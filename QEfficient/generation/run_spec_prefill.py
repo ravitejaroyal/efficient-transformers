@@ -13,6 +13,96 @@ from QEfficient.generation.spec_prefill import KeepConfig, SpecPrefillEngine
 from QEfficient.utils import load_hf_tokenizer
 
 
+# ---------- Apples-to-apples helpers (opt-in) ----------
+
+
+def build_messages(user_input: str, context: str) -> List[dict]:
+    """Mirror the GPU script's message construction."""
+    system_content = (
+        "You are a careful assistant that writes concise, faithful summaries of long U.S. "
+        "government reports. Capture the main purpose, scope, key findings, and recommendations. "
+        "Avoid speculation."
+    )
+    user_content = f"{user_input}\n\n[DOCUMENT START]\n{context}\n[DOCUMENT END]"
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def compute_prompt_budget_from_ctx(
+    ctx_len: int, max_new_tokens: int, *, buffer_tokens: int = 64
+) -> int:
+    """
+    Deterministic budget using the compile-time ctx_len:
+    budget = ctx_len - max_new_tokens - buffer
+    """
+    max_pos = int(ctx_len) if ctx_len and ctx_len > 0 else 8192
+    budget = max_pos - int(max_new_tokens) - int(buffer_tokens)
+    return max(512, budget)
+
+
+def apply_hf_format_to_string(
+    tokenizer,
+    raw_prompt: str,
+    *,
+    prompt_budget: int,
+    head_tail: bool,
+) -> str:
+    """
+    Reproduce GPU script’s pre-templating truncation and chat template output as a STRING.
+    - We treat the whole incoming prompt as 'context' and leave instruction empty.
+    - We do NOT return token IDs; we return a formatted string so the QEff pipeline
+      re-tokenizes identically with the same tokenizer.
+    """
+    # Fixed wrappers (same as the GPU script)
+    sys_txt = (
+        "You are a careful assistant that writes concise, faithful summaries of long U.S. "
+        "government reports. Capture the main purpose, scope, key findings, and recommendations. "
+        "Avoid speculation."
+    )
+    pre_ctx = "{instr}\n\n[DOCUMENT START]\n"
+    post_ctx = "\n[DOCUMENT END]"
+
+    # Tokenize wrappers for truncation accounting
+    sys_ids = tokenizer(sys_txt, add_special_tokens=False).input_ids
+    pre_ids = tokenizer(pre_ctx.format(instr=""), add_special_tokens=False).input_ids
+    post_ids = tokenizer(post_ctx, add_special_tokens=False).input_ids
+
+    instr = ""
+    ctx = raw_prompt
+
+    instr_ids = tokenizer(instr, add_special_tokens=False).input_ids
+    ctx_ids = tokenizer(ctx, add_special_tokens=False).input_ids
+
+    overhead = len(sys_ids) + len(pre_ids) + len(post_ids) + len(instr_ids)
+    allowed_ctx = max(0, prompt_budget - overhead)
+
+    if len(ctx_ids) > allowed_ctx:
+        if head_tail and allowed_ctx > 1:
+            head = allowed_ctx // 2
+            tail = allowed_ctx - head
+            ctx_ids = (
+                ctx_ids[:head]
+                + tokenizer("\n", add_special_tokens=False).input_ids
+                + ctx_ids[-tail:]
+            )
+        else:
+            ctx_ids = ctx_ids[:allowed_ctx]
+        ctx = tokenizer.decode(ctx_ids, skip_special_tokens=True)
+
+    messages = build_messages(instr, ctx)
+    formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return formatted_text
+
+
+# -------------------------------------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         "Speculative prefill validation (k=0) using spec_prefill + base prefill_from_ids."
@@ -90,6 +180,23 @@ def main() -> None:
         default=None,
         help="Optional: path to a text file with one reference per line, aligned with --prompt-file or the single --prompt.",
     )
+    # Apples-to-apples (GPU parity) – opt-in
+    parser.add_argument(
+        "--match-hf-format",
+        action="store_true",
+        help="Apply the same system prompt, wrappers, pre-templating truncation, and chat template as the GPU script.",
+    )
+    parser.add_argument(
+        "--truncate-to",
+        type=int,
+        default=None,
+        help="Token budget for prompt (instruction+context) BEFORE chat templating. If None, derive from --ctx-len.",
+    )
+    parser.add_argument(
+        "--head-tail",
+        action="store_true",
+        help="When truncating, keep head and tail (middle cut) instead of head-only.",
+    )
     args = parser.parse_args()
 
     # ---- Parse device lists (accepts "[0,1]" or "0,1" or "[0]") ----
@@ -105,6 +212,10 @@ def main() -> None:
     print(f"[devices] spec={spec_device_ids}  base={base_device_ids}")
 
     tokenizer = load_hf_tokenizer(pretrained_model_name_or_path=args.model_name)
+    # (Matches GPU habit) Ensure we have a PAD if model lacks one
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     # Load prompt: either raw string from --prompt or full file content from --prompt-file
     if args.prompt_file:
         with open(args.prompt_file, "r", encoding="utf-8") as fh:
@@ -123,6 +234,14 @@ def main() -> None:
         except Exception as e:
             print(f"[ROUGE] warning: failed to read --refs-file ({e}); skipping ROUGE.")
             refs = None
+
+    # Apples-to-apples: compute prompt budget (outside timing paths)
+    if args.match_hf_format:
+        prompt_budget = (
+            int(args.truncate_to)
+            if args.truncate_to is not None
+            else compute_prompt_budget_from_ctx(args.ctx_len, args.gen_len or 0, buffer_tokens=64)
+        )
 
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
@@ -165,12 +284,21 @@ def main() -> None:
         chunk=(not args.no_chunk),
         chunk_size=int(args.chunk_size),
     )
-    # --- compute prompt length S once for gating ---
-    # Collect predictions and aligned references for optional ROUGE scoring
+    # Collect predictions and aligned references for optional ROUGE scoring (outside timing)
     preds: List[str] = []
     aligned_refs: List[str] = []
 
     for idx, prompt_text in enumerate(prompts):
+        # Apples-to-apples formatting happens BEFORE any timing
+        if args.match_hf_format:
+            prompt_text = apply_hf_format_to_string(
+                tokenizer,
+                raw_prompt=prompt_text,
+                prompt_budget=prompt_budget,
+                head_tail=args.head_tail,
+            )
+
+        # --- compute prompt length S once for gating ---
         enc_for_len = tokenizer(prompt_text, return_tensors="np")
         S = int(enc_for_len["input_ids"].shape[1])
         p = float(args.keep_percentage)
@@ -228,7 +356,7 @@ def main() -> None:
         # --- Optional: print/save pruned-path base decode output for verification ---
         gen_txt = ret.get("generated_text_pruned", None)
         if gen_txt is not None:
-            # Collect prediction for ROUGE (if references provided)
+            # Collect prediction for optional ROUGE
             preds.append(gen_txt.strip())
             if refs is not None and idx < len(refs):
                 aligned_refs.append(refs[idx])
