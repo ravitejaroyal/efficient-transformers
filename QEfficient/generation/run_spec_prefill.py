@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
-import evaluate  # <-- added for ROUGE
+import evaluate  # Optional ROUGE (only runs when refs are available)
+from datasets import load_dataset  # <-- dataset support
 
 from QEfficient.generation.base_infer import TextGeneration
 from QEfficient.generation.spec_prefill import KeepConfig, SpecPrefillEngine
@@ -14,7 +15,6 @@ from QEfficient.utils import load_hf_tokenizer
 
 
 # ---------- Apples-to-apples helpers (opt-in) ----------
-
 
 def build_messages(user_input: str, context: str) -> List[dict]:
     """Mirror the GPU script's message construction."""
@@ -42,18 +42,17 @@ def compute_prompt_budget_from_ctx(
     return max(512, budget)
 
 
-def apply_hf_format_to_string(
+def truncate_instr_ctx_like_gpu(
     tokenizer,
-    raw_prompt: str,
+    instr: str,
+    ctx: str,
     *,
     prompt_budget: int,
     head_tail: bool,
-) -> str:
+) -> Tuple[str, str]:
     """
-    Reproduce GPU script’s pre-templating truncation and chat template output as a STRING.
-    - We treat the whole incoming prompt as 'context' and leave instruction empty.
-    - We do NOT return token IDs; we return a formatted string so the QEff pipeline
-      re-tokenizes identically with the same tokenizer.
+    Reproduce the GPU script’s pre-templating truncation accounting.
+    Returns possibly-truncated (instr, ctx). (We leave instr unchanged here; GPU path truncates ctx.)
     """
     # Fixed wrappers (same as the GPU script)
     sys_txt = (
@@ -68,9 +67,6 @@ def apply_hf_format_to_string(
     sys_ids = tokenizer(sys_txt, add_special_tokens=False).input_ids
     pre_ids = tokenizer(pre_ctx.format(instr=""), add_special_tokens=False).input_ids
     post_ids = tokenizer(post_ctx, add_special_tokens=False).input_ids
-
-    instr = ""
-    ctx = raw_prompt
 
     instr_ids = tokenizer(instr, add_special_tokens=False).input_ids
     ctx_ids = tokenizer(ctx, add_special_tokens=False).input_ids
@@ -91,11 +87,22 @@ def apply_hf_format_to_string(
             ctx_ids = ctx_ids[:allowed_ctx]
         ctx = tokenizer.decode(ctx_ids, skip_special_tokens=True)
 
+    return instr, ctx
+
+
+def apply_hf_format_to_pair(
+    tokenizer,
+    instr: str,
+    ctx: str,
+) -> str:
+    """
+    Chat-template the (instr, ctx) pair into a STRING (not tokenized).
+    """
     messages = build_messages(instr, ctx)
     formatted_text = tokenizer.apply_chat_template(
         messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        tokenize=False,               # IMPORTANT: return string; QEff re-tokenizes internally
+        add_generation_prompt=True,   # same as GPU path
     )
     return formatted_text
 
@@ -173,7 +180,6 @@ def main() -> None:
         default=None,
         help="If set, save the pruned-path base decode text to this file.",
     )
-    # Optional references file for ROUGE scoring (one line per prompt)
     parser.add_argument(
         "--refs-file",
         type=str,
@@ -197,6 +203,50 @@ def main() -> None:
         action="store_true",
         help="When truncating, keep head and tail (middle cut) instead of head-only.",
     )
+    # ------------------- Dataset options (LongBench-like) -------------------
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Optional HF dataset path (e.g., 'THUDM/LongBench'). If set, prompts+refs are loaded from dataset (ignore --prompt/--prompt-file).",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default="gov_report",
+        help="Dataset configuration name (e.g., 'gov_report' for LongBench).",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        type=str,
+        default="test",
+        help="Dataset split to load (e.g., 'test').",
+    )
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=50,
+        help="-1 for all; otherwise take the first N examples from the dataset split.",
+    )
+    # Field mapping for dataset → (instruction, context, reference)
+    parser.add_argument(
+        "--input-field",
+        type=str,
+        default="input",
+        help="Dataset field that contains the instruction/user input (default: 'input' for LongBench).",
+    )
+    parser.add_argument(
+        "--context-field",
+        type=str,
+        default="context",
+        help="Dataset field that contains the document/context (default: 'context' for LongBench).",
+    )
+    parser.add_argument(
+        "--reference-field",
+        type=str,
+        default="answers",
+        help="Dataset field that contains reference(s); string or list[str] (default: 'answers' for LongBench).",
+    )
     args = parser.parse_args()
 
     # ---- Parse device lists (accepts "[0,1]" or "0,1" or "[0]") ----
@@ -216,32 +266,63 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load prompt: either raw string from --prompt or full file content from --prompt-file
-    if args.prompt_file:
-        with open(args.prompt_file, "r", encoding="utf-8") as fh:
-            # prompt_text = fh.read()
-            prompts = [line.strip() for line in fh if line.strip()]
-    else:
-        # prompt_text = args.prompt
-        prompts = [args.prompt]
-
-    # Optional references aligned with prompts
+    # ------------------- Build prompts + references -------------------
+    prompts: List[Tuple[str, str]] = []
     refs: Optional[List[str]] = None
-    if args.refs_file:
-        try:
-            with open(args.refs_file, "r", encoding="utf-8") as rf:
-                refs = [line.strip() for line in rf]
-        except Exception as e:
-            print(f"[ROUGE] warning: failed to read --refs-file ({e}); skipping ROUGE.")
-            refs = None
+
+    if args.dataset:
+        # Load dataset (e.g., THUDM/LongBench gov_report)
+        ds = load_dataset(args.dataset, args.dataset_config, split=args.dataset_split)
+        if args.max_examples != -1:
+            ds = ds.select(range(min(len(ds), args.max_examples)))
+        prompts = []
+        refs = []
+        # Extract fields; LongBench gov_report: input (instr), context (doc), answers (list[str])
+        for ex in ds:
+            instr = (ex.get(args.input_field) or "") if args.input_field else ""
+            ctx = (ex.get(args.context_field) or "") if args.context_field else ""
+            ref_raw = ex.get(args.reference_field, "")
+            if isinstance(ref_raw, list) and ref_raw:
+                ref = ref_raw[0]
+            elif isinstance(ref_raw, str):
+                ref = ref_raw
+            else:
+                ref = ""
+            prompts.append((instr, ctx))
+            refs.append(ref)
+    else:
+        # Fallback to CLI prompt(s)
+        if args.prompt_file:
+            with open(args.prompt_file, "r", encoding="utf-8") as fh:
+                plain_prompts = [line.strip() for line in fh if line.strip()]
+        else:
+            plain_prompts = [args.prompt]
+        prompts = [("", ptxt) for ptxt in plain_prompts]
+        if args.refs_file:
+            try:
+                with open(args.refs_file, "r", encoding="utf-8") as rf:
+                    refs = [line.strip() for line in rf]
+            except Exception as e:
+                print(f"[ROUGE] warning: failed to read --refs-file ({e}); skipping ROUGE.")
+                refs = None
 
     # Apples-to-apples: compute prompt budget (outside timing paths)
+    prompt_budget: Optional[int] = None
     if args.match_hf_format:
         prompt_budget = (
             int(args.truncate_to)
             if args.truncate_to is not None
             else compute_prompt_budget_from_ctx(args.ctx_len, args.gen_len or 0, buffer_tokens=64)
         )
+
+    def format_prompt(instr: str, ctx: str) -> str:
+        if args.match_hf_format:
+            assert prompt_budget is not None
+            instr_tr, ctx_tr = truncate_instr_ctx_like_gpu(
+                tokenizer, instr, ctx, prompt_budget=prompt_budget, head_tail=args.head_tail
+            )
+            return apply_hf_format_to_pair(tokenizer, instr_tr, ctx_tr)
+        return ctx if not instr else f"{instr}\n\n{ctx}"
 
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
@@ -258,15 +339,18 @@ def main() -> None:
         device_id=base_device_ids,
     )._qaic_model
 
-    if os.getenv("QEFF_SPEC_DEBUG", ""):
+    if os.getenv("QEFF_SPEC_DEBUG", "") and prompts:
+        debug_prompt_text = format_prompt(*prompts[0])
         print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
         out_full, pos_ids, gen_len = base.run_prefill(
-            [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+            [debug_prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
         )
+        import numpy as _np  # avoid shadowing
+
         orig_seq_len = int(pos_ids.max())
-        enc_full = tokenizer(prompt_text, return_tensors="np")
+        enc_full = tokenizer(debug_prompt_text, return_tensors="np")
         ids_full = enc_full["input_ids"][:, :orig_seq_len]
-        pos_full = np.arange(orig_seq_len, dtype=np.int64).reshape(1, -1)
+        pos_full = _np.arange(orig_seq_len, dtype=_np.int64).reshape(1, -1)
 
         out_ids, seq_len_ret, padded_len, num_chunks = base.prefill_from_ids(
             ids_full, pos_full, prefill_logit_bs=1
@@ -278,25 +362,23 @@ def main() -> None:
         )
 
         print("\n[2/2] Integration: spec prefill → importance → keep_idx → base.prefill_from_ids")
+
     keep_cfg = KeepConfig(
         strategy="percentage",
         percentage=float(args.keep_percentage),
         chunk=(not args.no_chunk),
         chunk_size=int(args.chunk_size),
     )
+
     # Collect predictions and aligned references for optional ROUGE scoring (outside timing)
     preds: List[str] = []
     aligned_refs: List[str] = []
 
-    for idx, prompt_text in enumerate(prompts):
-        # Apples-to-apples formatting happens BEFORE any timing
-        if args.match_hf_format:
-            prompt_text = apply_hf_format_to_string(
-                tokenizer,
-                raw_prompt=prompt_text,
-                prompt_budget=prompt_budget,
-                head_tail=args.head_tail,
-            )
+    # --- loop over prompts ---
+    for idx, pair in enumerate(prompts):
+        instr, ctx = pair
+
+        prompt_text = format_prompt(instr, ctx)
 
         # --- compute prompt length S once for gating ---
         enc_for_len = tokenizer(prompt_text, return_tensors="np")
@@ -307,21 +389,27 @@ def main() -> None:
 
         if length_gate or high_keep_gate:
             reason = "short_prompt" if length_gate else "high_keep"
-            print(f"[gate] SKIP SpecPrefill (reason={reason})  S={S}  min_spec_len={args.min_spec_len}  keep={p:.2f}  max_keep_for_spec={args.max_keep_for_spec:.2f}")
+            print(
+                f"[gate] SKIP SpecPrefill (reason={reason})  S={S}  min_spec_len={args.min_spec_len}  "
+                f"keep={p:.2f}  max_keep_for_spec={args.max_keep_for_spec:.2f}"
+            )
             # Baseline only (faithful TTFT for comparison)
             t0 = time.time()
-            out_base_full, pos_full, _ = base.run_prefill(
+            base.run_prefill(
                 [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
             )
             ttft_base_full_s = time.time() - t0
             print("\n[TTFT]")
             print(f" S={S} kept={S} (no pruning)")
-            print(" base_full={:.1f} ms | spec_device=SKIPPED | host_scoring=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
-            # No speculative output in this branch
-            return
+            print(
+                " base_full={:.1f} ms | spec_device=SKIPPED | host_scoring=SKIPPED | "
+                "base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s * 1000.0)
+            )
+            continue
         else:
             print(f"[gate] RUN SpecPrefill  S={S}  keep={p:.2f}  L_sel={args.layers_for_scoring}")
 
+        # Speculative prefill (timings inside SpecPrefillEngine remain unchanged)
         ret = spec.prune_and_base_prefill(
             base_engine=base,
             prompt=prompt_text,
@@ -333,7 +421,7 @@ def main() -> None:
             look_ahead=int(args.look_ahead),
         )
 
-        # --- Pretty, accurate TTFT breakdown ---
+        # --- Pretty, accurate TTFT breakdown (from ret) ---
         try:
             S = ret.get("S", None)
             kept = ret.get("kept", None)
@@ -347,8 +435,14 @@ def main() -> None:
             if S is not None and kept is not None:
                 print(f"  S={S}  kept={kept}")
             print(
-                "  base_full={:.1f} ms | spec_device={:.1f} ms | host_scoring={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
-                .format(ttft_base_full_ms, ttft_spec_device_ms, ttft_host_scoring_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
+                "  base_full={:.1f} ms | spec_device={:.1f} ms | host_scoring={:.1f} ms | "
+                "base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms".format(
+                    ttft_base_full_ms,
+                    ttft_spec_device_ms,
+                    ttft_host_scoring_ms,
+                    ttft_base_pruned_ms,
+                    ttft_spec_total_ms,
+                )
             )
         except Exception as e:
             print(f"[TTFT] warning: could not format timing breakdown ({e}); raw ret: {ret}")
@@ -356,13 +450,11 @@ def main() -> None:
         # --- Optional: print/save pruned-path base decode output for verification ---
         gen_txt = ret.get("generated_text_pruned", None)
         if gen_txt is not None:
-            # Collect prediction for optional ROUGE
             preds.append(gen_txt.strip())
             if refs is not None and idx < len(refs):
                 aligned_refs.append(refs[idx])
 
             if args.print_pruned_output:
-                # Print a trimmed preview (avoid flooding console on long outputs)
                 preview = gen_txt if len(gen_txt) <= 400 else (gen_txt[:400] + " …")
                 print("\n[pruned:base:output]")
                 print(preview)
@@ -377,9 +469,25 @@ def main() -> None:
             if args.print_pruned_output or args.save_pruned_output:
                 print("[pruned:base:output] no generated_text_pruned present; ensure --gen-len > 0 was passed through.")
 
-    # ---- Optional ROUGE scoring (only if aligned references are provided) ----
+    # ---- ROUGE scoring when dataset provided (or aligned refs available) ----
     try:
-        if aligned_refs and len(preds) == len(aligned_refs):
+        if args.dataset and refs is not None and len(preds) == len(refs) and len(preds) > 0:
+            rouge = evaluate.load("rouge")
+            scores = rouge.compute(
+                predictions=preds,
+                references=refs,
+                rouge_types=["rouge1", "rouge2", "rougeL", "rougeLsum"],
+            )
+            print("\n[ROUGE] results over {} example(s):".format(len(preds)))
+            print(
+                "  rouge1={:.4f}  rouge2={:.4f}  rougeL={:.4f}  rougeLsum={:.4f}".format(
+                    scores.get("rouge1", 0.0),
+                    scores.get("rouge2", 0.0),
+                    scores.get("rougeL", 0.0),
+                    scores.get("rougeLsum", 0.0),
+                )
+            )
+        elif not args.dataset and aligned_refs and len(preds) == len(aligned_refs):
             rouge = evaluate.load("rouge")
             scores = rouge.compute(
                 predictions=preds,
@@ -395,9 +503,8 @@ def main() -> None:
                     scores.get("rougeLsum", 0.0),
                 )
             )
-        elif args.refs_file:
-            # If refs were requested but counts mismatch, be explicit
-            n_refs = 0 if not refs else len(refs)
+        elif refs is not None:
+            n_refs = len(refs)
             print(f"[ROUGE] warning: could not compute ROUGE (preds={len(preds)} vs refs={n_refs}).")
     except Exception as e:
         print(f"[ROUGE] warning: failed to compute ROUGE ({e}).")
