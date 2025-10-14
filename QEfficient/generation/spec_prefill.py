@@ -1220,7 +1220,39 @@ class SpecPrefillEngine:
         # ---- OPTIONAL: run decode on the pruned path to capture the speculative base output ----
         generated_text_pruned = None
         try:
-            if gen_len is not None and int(gen_len) > 0:
+            if gen_len is None:
+                # Decode until EOS or remaining context budget.
+                # Remaining budget ensures we never exceed compiled ctx length.
+                remaining = max(1, int(self._ctx_len) - int(S))
+                base_engine.initialize_decode_inputs(1, 1, remaining)
+                next_pos = np.array([[S]], dtype=np.int64)
+                base_engine.update_decode_input(out_base_pruned, next_pos, generation_len=remaining)
+                decode_inputs = base_engine.prepare_decode_inputs()
+                # Reset generated ids buffer to collect continuation
+                base_engine.generated_ids = []
+                eos_id = getattr(self.tokenizer, "eos_token_id", None)
+                # Stepwise loop allows early stop on EOS
+                for _ in range(remaining):
+                    _ = base_engine.run_decode(decode_inputs, generation_len=1)
+                    decode_inputs = base_engine.prepare_decode_inputs()
+                    # Early stop on EOS (if tokenizer provides one)
+                    try:
+                        if (
+                            eos_id is not None
+                            and base_engine.generated_ids
+                            and base_engine.generated_ids[0][-1] == eos_id
+                        ):
+                            break
+                    except Exception:
+                        # Be conservative; if structure differs, just continue to remaining cap
+                        pass
+                generated = self.tokenizer.batch_decode(
+                    base_engine.generated_ids, skip_special_tokens=True
+                )
+                if isinstance(generated, list) and len(generated) > 0:
+                    generated_text_pruned = generated[0]
+            elif int(gen_len) > 0:
+                # Existing fixed-length behavior
                 base_engine.initialize_decode_inputs(1, 1, int(gen_len))
                 next_pos = np.array([[S]], dtype=np.int64)
                 base_engine.update_decode_input(
@@ -1234,6 +1266,7 @@ class SpecPrefillEngine:
                 if isinstance(generated, list) and len(generated) > 0:
                     generated_text_pruned = generated[0]
         except Exception:
+            # Decode is optional; do not affect TTFT accounting
             pass
 
         # Always print a compact TTFT summary (ms)
