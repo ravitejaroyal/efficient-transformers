@@ -104,7 +104,7 @@ def apply_hf_format_to_pair(
         tokenize=False,               # IMPORTANT: return string; QEff re-tokenizes internally
         add_generation_prompt=True,   # same as GPU path
     )
-    return formatted_text
+    return formatted_text.rstrip()
 
 
 # -------------------------------------------------------
@@ -322,7 +322,8 @@ def main() -> None:
                 tokenizer, instr, ctx, prompt_budget=prompt_budget, head_tail=args.head_tail
             )
             return apply_hf_format_to_pair(tokenizer, instr_tr, ctx_tr)
-        return ctx if not instr else f"{instr}\n\n{ctx}"
+        plain = ctx if not instr else f"{instr}\n\n{ctx}"
+        return plain.rstrip()
 
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
