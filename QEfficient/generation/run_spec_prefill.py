@@ -100,9 +100,11 @@ def main() -> None:
     # Load prompt: either raw string from --prompt or full file content from --prompt-file
     if args.prompt_file:
         with open(args.prompt_file, "r", encoding="utf-8") as fh:
-            prompt_text = fh.read()
+            # prompt_text = fh.read()
+            prompts = [line.strip() for line in fh if line.strip()]
     else:
-        prompt_text = args.prompt
+        # prompt_text = args.prompt
+        prompts = [args.prompt]
     spec = SpecPrefillEngine(
         tokenizer=tokenizer,
         qpc_path=args.spec_qpc,
@@ -145,78 +147,79 @@ def main() -> None:
         chunk_size=int(args.chunk_size),
     )
     # --- compute prompt length S once for gating ---
-    enc_for_len = tokenizer(prompt_text, return_tensors="np")
-    S = int(enc_for_len["input_ids"].shape[1])
-    p = float(args.keep_percentage)
-    length_gate = (S < int(args.min_spec_len))
-    high_keep_gate = (p > float(args.max_keep_for_spec))
+    for prompt_text in prompts:
+        enc_for_len = tokenizer(prompt_text, return_tensors="np")
+        S = int(enc_for_len["input_ids"].shape[1])
+        p = float(args.keep_percentage)
+        length_gate = (S < int(args.min_spec_len))
+        high_keep_gate = (p > float(args.max_keep_for_spec))
 
-    if length_gate or high_keep_gate:
-        reason = "short_prompt" if length_gate else "high_keep"
-        print(f"[gate] SKIP SpecPrefill (reason={reason})  S={S}  min_spec_len={args.min_spec_len}  keep={p:.2f}  max_keep_for_spec={args.max_keep_for_spec:.2f}")
-        # Baseline only (faithful TTFT for comparison)
-        t0 = time.time()
-        out_base_full, pos_full, _ = base.run_prefill(
-            [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+        if length_gate or high_keep_gate:
+            reason = "short_prompt" if length_gate else "high_keep"
+            print(f"[gate] SKIP SpecPrefill (reason={reason})  S={S}  min_spec_len={args.min_spec_len}  keep={p:.2f}  max_keep_for_spec={args.max_keep_for_spec:.2f}")
+            # Baseline only (faithful TTFT for comparison)
+            t0 = time.time()
+            out_base_full, pos_full, _ = base.run_prefill(
+                [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+            )
+            ttft_base_full_s = time.time() - t0
+            print("\n[TTFT]")
+            print(f" S={S} kept={S} (no pruning)")
+            print(" base_full={:.1f} ms | spec_device=SKIPPED | host_scoring=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
+            # No speculative output in this branch
+            return
+        else:
+            print(f"[gate] RUN SpecPrefill  S={S}  keep={p:.2f}  L_sel={args.layers_for_scoring}")
+
+        ret = spec.prune_and_base_prefill(
+            base_engine=base,
+            prompt=prompt_text,
+            pool_kernel_size=13,
+            keep_cfg=keep_cfg,
+            prefill_logit_bs=1,
+            layers_sel=args.layers_for_scoring,
+            gen_len=int(args.gen_len) if args.gen_len is not None else None,
+            look_ahead=int(args.look_ahead),
         )
-        ttft_base_full_s = time.time() - t0
-        print("\n[TTFT]")
-        print(f" S={S} kept={S} (no pruning)")
-        print(" base_full={:.1f} ms | spec_device=SKIPPED | host_scoring=SKIPPED | base_prefill_pruned=SKIPPED | speculative_total=SKIPPED".format(ttft_base_full_s*1000.0))
-        # No speculative output in this branch
-        return
-    else:
-        print(f"[gate] RUN SpecPrefill  S={S}  keep={p:.2f}  L_sel={args.layers_for_scoring}")
 
-    ret = spec.prune_and_base_prefill(
-        base_engine=base,
-        prompt=prompt_text,
-        pool_kernel_size=13,
-        keep_cfg=keep_cfg,
-        prefill_logit_bs=1,
-        layers_sel=args.layers_for_scoring,
-        gen_len=int(args.gen_len) if args.gen_len is not None else None,
-        look_ahead=int(args.look_ahead),
-    )
+        # --- Pretty, accurate TTFT breakdown ---
+        try:
+            S = ret.get("S", None)
+            kept = ret.get("kept", None)
+            ttft_base_full_ms = ret["ttft_baseline_s"] * 1000.0
+            ttft_spec_device_ms = ret["ttft_spec_device_s"] * 1000.0
+            ttft_host_scoring_ms = ret["ttft_host_scoring_s"] * 1000.0
+            ttft_base_pruned_ms = ret["ttft_base_pruned_only_s"] * 1000.0
+            ttft_spec_total_ms = ret["ttft_speculative_s"] * 1000.0
 
-    # --- Pretty, accurate TTFT breakdown ---
-    try:
-        S = ret.get("S", None)
-        kept = ret.get("kept", None)
-        ttft_base_full_ms = ret["ttft_baseline_s"] * 1000.0
-        ttft_spec_device_ms = ret["ttft_spec_device_s"] * 1000.0
-        ttft_host_scoring_ms = ret["ttft_host_scoring_s"] * 1000.0
-        ttft_base_pruned_ms = ret["ttft_base_pruned_only_s"] * 1000.0
-        ttft_spec_total_ms = ret["ttft_speculative_s"] * 1000.0
+            print("\n[TTFT]")
+            if S is not None and kept is not None:
+                print(f"  S={S}  kept={kept}")
+            print(
+                "  base_full={:.1f} ms | spec_device={:.1f} ms | host_scoring={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
+                .format(ttft_base_full_ms, ttft_spec_device_ms, ttft_host_scoring_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
+            )
+        except Exception as e:
+            print(f"[TTFT] warning: could not format timing breakdown ({e}); raw ret: {ret}")
 
-        print("\n[TTFT]")
-        if S is not None and kept is not None:
-            print(f"  S={S}  kept={kept}")
-        print(
-            "  base_full={:.1f} ms | spec_device={:.1f} ms | host_scoring={:.1f} ms | base_prefill_pruned={:.1f} ms | speculative_total={:.1f} ms"
-            .format(ttft_base_full_ms, ttft_spec_device_ms, ttft_host_scoring_ms, ttft_base_pruned_ms, ttft_spec_total_ms)
-        )
-    except Exception as e:
-        print(f"[TTFT] warning: could not format timing breakdown ({e}); raw ret: {ret}")
-
-    # --- Optional: print/save pruned-path base decode output for verification ---
-    gen_txt = ret.get("generated_text_pruned", None)
-    if gen_txt is not None:
-        if args.print_pruned_output:
-            # Print a trimmed preview (avoid flooding console on long outputs)
-            preview = gen_txt if len(gen_txt) <= 400 else (gen_txt[:400] + " …")
-            print("\n[pruned:base:output]")
-            print(preview)
-        if args.save_pruned_output:
-            try:
-                with open(args.save_pruned_output, "w", encoding="utf-8") as fh:
-                    fh.write(gen_txt)
-                print(f"[pruned:base:output] saved to {args.save_pruned_output}")
-            except Exception as e:
-                print(f"[pruned:base:output] failed to save to {args.save_pruned_output}: {e}")
-    else:
-        if args.print_pruned_output or args.save_pruned_output:
-            print("[pruned:base:output] no generated_text_pruned present; ensure --gen-len > 0 was passed through.")
+        # --- Optional: print/save pruned-path base decode output for verification ---
+        gen_txt = ret.get("generated_text_pruned", None)
+        if gen_txt is not None:
+            if args.print_pruned_output:
+                # Print a trimmed preview (avoid flooding console on long outputs)
+                preview = gen_txt if len(gen_txt) <= 400 else (gen_txt[:400] + " …")
+                print("\n[pruned:base:output]")
+                print(preview)
+            if args.save_pruned_output:
+                try:
+                    with open(args.save_pruned_output, "w", encoding="utf-8") as fh:
+                        fh.write(gen_txt)
+                    print(f"[pruned:base:output] saved to {args.save_pruned_output}")
+                except Exception as e:
+                    print(f"[pruned:base:output] failed to save to {args.save_pruned_output}: {e}")
+        else:
+            if args.print_pruned_output or args.save_pruned_output:
+                print("[pruned:base:output] no generated_text_pruned present; ensure --gen-len > 0 was passed through.")
 
 
 if __name__ == "__main__":
