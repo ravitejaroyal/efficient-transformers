@@ -97,6 +97,7 @@ def apply_hf_format_to_pair(
 ) -> str:
     """
     Chat-template the (instr, ctx) pair into a STRING (not tokenized).
+    Trim trailing whitespace to avoid newline sink as the last token.
     """
     messages = build_messages(instr, ctx)
     formatted_text = tokenizer.apply_chat_template(
@@ -104,7 +105,7 @@ def apply_hf_format_to_pair(
         tokenize=False,               # IMPORTANT: return string; QEff re-tokenizes internally
         add_generation_prompt=True,   # same as GPU path
     )
-    return formatted_text.rstrip()
+    return formatted_text.rstrip()    # avoid trailing '\n' / spaces at end
 
 
 # -------------------------------------------------------
@@ -123,7 +124,13 @@ def main() -> None:
         help="Prompt string.",
     )
     parser.add_argument("--ctx-len", type=int, default=128, help="Context length used by both engines.")
-    parser.add_argument("--gen-len", type=int, default=16, help="Decode steps for parity check.")
+    # CHANGED: default=None so "entire output" mode kicks in when omitted
+    parser.add_argument(
+        "--gen-len",
+        type=int,
+        default=None,
+        help="Decode steps. If omitted, decode until EOS or remaining context limit.",
+    )
     parser.add_argument("--prompt-file", type=str, default=None,
                         help="Read the entire file as a single prompt (e.g., a 100k-token prompt). If set, overrides --prompt.")
     # Separate device groups for speculator and base engines
@@ -343,8 +350,9 @@ def main() -> None:
     if os.getenv("QEFF_SPEC_DEBUG", "") and prompts:
         debug_prompt_text = format_prompt(*prompts[0])
         print("\n[1/2] Unit: base.prefill_from_ids parity (identity keep)")
+        gen_len_pass = args.gen_len if args.gen_len is not None else None
         out_full, pos_ids, gen_len = base.run_prefill(
-            [debug_prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+            [debug_prompt_text], generation_len=gen_len_pass, prefill_logit_bs=1
         )
         import numpy as _np  # avoid shadowing
 
@@ -396,8 +404,9 @@ def main() -> None:
             )
             # Baseline only (faithful TTFT for comparison)
             t0 = time.time()
+            gen_len_pass = args.gen_len if args.gen_len is not None else None
             base.run_prefill(
-                [prompt_text], generation_len=int(args.gen_len), prefill_logit_bs=1
+                [prompt_text], generation_len=gen_len_pass, prefill_logit_bs=1
             )
             ttft_base_full_s = time.time() - t0
             print("\n[TTFT]")
