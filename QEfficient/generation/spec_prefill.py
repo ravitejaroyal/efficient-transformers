@@ -93,6 +93,23 @@ class SpecPrefillEngine:
         past_outs = [n for n in self._session.output_names if n.startswith("past_value.")]
         self._session.skip_buffers(past_inputs + past_outs)
 
+    def reset_cache(self) -> None:
+        """Clear per-prompt state so each new prompt actually runs prefill."""
+        # force a fresh prefill on the next call
+        self._prefill_cache = None
+        self._last_outputs = None
+        # reset I/O tallies so [spec:io-total] is per-prompt (not cumulative)
+        try:
+            self._prefill_io_totals = {
+                k: {"bytes": 0, "ms": 0.0}
+                for k in ("prefill_queries", "past_key", "past_value", "logits", "other")
+            }
+            self._prefill_io_total_ms = 0.0
+        except Exception:
+            pass
+        # ensure kept layers are recomputed by run_prefill()
+        self._kept_layers = []
+
     def _set_tokenizer_params(self):
         """
         Sets the tokenizer parameters for the model.
