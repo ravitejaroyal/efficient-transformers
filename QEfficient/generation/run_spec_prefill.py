@@ -388,6 +388,8 @@ def main() -> None:
         instr, ctx = pair
 
         prompt_text = format_prompt(instr, ctx)
+        # force a fresh spec prefill for this prompt (no cross-sample cache reuse)
+        spec.reset_cache()
 
         # --- compute prompt length S once for gating ---
         enc_for_len = tokenizer(prompt_text, return_tensors="np")
